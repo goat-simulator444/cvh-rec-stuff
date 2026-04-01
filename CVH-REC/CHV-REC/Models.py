@@ -1,0 +1,255 @@
+import h5py
+import math
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class ProjectionMLP(nn.Module):
+    def __init__(self, dim, hidden_dim=None):
+        super().__init__()
+        if hidden_dim is None:
+            hidden_dim = dim
+        self.fc1 = nn.Linear(dim, hidden_dim)
+        self.norm = nn.LayerNorm(hidden_dim)  # 加norm
+        self.fc2 = nn.Linear(hidden_dim, dim)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.norm(x)
+        x = torch.nn.GELU()(x)  # GELU相对ELU数值更平稳
+        return self.fc2(x)
+
+class HCF(nn.Module):
+    def __init__(self, n_users, n_items, n_tags,
+                 embedding_dim, layer_num, dropout_list, embedding_dir='data',
+                 use_hypergraph_attention=False, attn_temperature=0.7, attn_prior_weight=0.2):
+        super().__init__()
+        self.n_users = n_users
+        self.n_items = n_items
+        self.n_tags = n_tags
+        self.embedding_dir = embedding_dir
+
+        self.embedding_dim = embedding_dim
+        self.n_layers = layer_num
+        self.use_hypergraph_attention = bool(use_hypergraph_attention)
+        self.attn_temperature = float(attn_temperature)
+        self.attn_prior_weight = float(attn_prior_weight)
+
+        # torch.manual_seed(50)
+
+        # 初始化embedding，先用占位，后面用预训练权重替换
+        self.mashup_call_embedding = nn.Embedding(n_users, embedding_dim)
+        self.api_call_embedding = nn.Embedding(n_items, embedding_dim)
+
+        self.mashup_tag_embedding = nn.Embedding(n_users, embedding_dim)
+        self.api_tag_embedding = nn.Embedding(n_items, embedding_dim)
+
+        self.global_embedding = nn.Embedding(n_users + n_items + n_tags, embedding_dim)
+
+        # Lightweight node-edge attention gates for each relation view.
+        self.node_attn_query = nn.Linear(self.embedding_dim, self.embedding_dim, bias=False)
+        self.node_attn_key = nn.Linear(self.embedding_dim, self.embedding_dim, bias=False)
+
+        self.dropout_list = nn.ModuleList([nn.Dropout(p) for p in dropout_list])
+
+        self.u_weights = nn.Parameter(torch.ones(self.n_layers))
+        self.i_weights = nn.Parameter(torch.ones(self.n_layers))
+        self.m_weights = nn.Parameter(torch.ones(self.n_layers))
+        self.a_weights = nn.Parameter(torch.ones(self.n_layers))
+        self.m_t_weights = nn.Parameter(torch.ones(self.n_layers))
+        self.a_t_weights = nn.Parameter(torch.ones(self.n_layers))
+        self.global_weights = nn.Parameter(torch.ones(self.n_layers))
+
+        # 融合视角权重
+        self.mashup_view_weights = nn.Parameter(torch.ones(2))  # [call, tag]
+        self.api_view_weights = nn.Parameter(torch.ones(2))  # [call, tag]
+
+        # 全局局部权重
+        self.mashup_l_g_weights = nn.Parameter(torch.ones(2))  # [local, global]
+        self.api_l_g_weights = nn.Parameter(torch.ones(2))  # [local, global]
+
+        # 用于对比学习的投影头
+        self.mashup_local_proj = ProjectionMLP(self.embedding_dim)
+        self.mashup_global_proj = ProjectionMLP(self.embedding_dim)
+        self.api_local_proj = ProjectionMLP(self.embedding_dim)
+        self.api_global_proj = ProjectionMLP(self.embedding_dim)
+
+        self.mashup_tag_predictor = nn.Linear(self.embedding_dim, self.n_tags)  # 输入mashup_final的维度
+        self.api_tag_predictor = nn.Linear(self.embedding_dim, self.n_tags)
+
+        self._init_weight_()
+
+    def load_pretrained_embeddings(self, num, file):
+        data = []
+        # Open the HDF5 file once to avoid repeated low-level open/close calls.
+        with h5py.File(file, 'r') as f:
+            for i in range(num):
+                key = str(i)
+                if key not in f:
+                    raise ValueError(f"Missing vector for id {i} in {file}")
+                data.append(f[key][:])
+        tensor = torch.FloatTensor(data)
+        if tensor.size(1) != self.embedding_dim:
+            raise ValueError(
+                f"Embedding dimension mismatch in {file}: got {tensor.size(1)}, expected {self.embedding_dim}. "
+                f"Regenerate vectors with matching text model or set --embed_size correctly."
+            )
+        return tensor
+
+    def _init_weight_(self):
+        vectors_file = os.path.join(self.embedding_dir, 'vectors.h5')
+        api_vectors_file = os.path.join(self.embedding_dir, 'API_vectors.h5')
+        tag_vectors_file = os.path.join(self.embedding_dir, 'tag_vectors.h5')
+
+        self.mashup_call_embedding.weight.data = self.load_pretrained_embeddings(self.n_users, vectors_file)
+        self.api_call_embedding.weight.data = self.load_pretrained_embeddings(self.n_items, api_vectors_file)
+        mashup_embedding = self.load_pretrained_embeddings(self.n_users, vectors_file)
+        api_embedding = self.load_pretrained_embeddings(self.n_items, api_vectors_file)
+        tag_embedding = self.load_pretrained_embeddings(self.n_tags, tag_vectors_file)
+        self.global_embedding.weight.data = torch.cat([mashup_embedding, api_embedding, tag_embedding], dim=0)
+
+        self.mashup_tag_embedding.weight.data = self.load_pretrained_embeddings(self.n_users, vectors_file)
+        self.api_tag_embedding.weight.data = self.load_pretrained_embeddings(self.n_items, api_vectors_file)
+
+        # 允许训练更新
+        self.mashup_call_embedding.weight.requires_grad = True
+        self.api_call_embedding.weight.requires_grad = True
+
+        self.mashup_tag_embedding.weight.requires_grad = True
+        self.api_tag_embedding.weight.requires_grad = True
+
+        self.global_embedding.weight.requires_grad = True
+
+    def propagate_embeddings(self, adj1, adj2, init_emb, weights):
+        """
+
+        通用传播计算：使用两个稀疏矩阵adj2和adj1交替乘法多层传播，最后按权重加权求和。
+        """
+        embeddings = [init_emb]
+        for _ in range(self.n_layers):
+            t = torch.sparse.mm(adj2, embeddings[-1])
+            t = torch.sparse.mm(adj1, t)
+            embeddings.append(t)
+        stacked = torch.stack(embeddings[:self.n_layers], dim=1)  # 取前n_layers层
+        w = torch.softmax(weights, dim=0)
+        out = torch.sum(stacked * w.view(1, self.n_layers, 1), dim=1)
+        return out
+
+    def _safe_cosine(self, x, y):
+        x = F.normalize(torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4), dim=-1)
+        y = F.normalize(torch.nan_to_num(y, nan=0.0, posinf=1e4, neginf=-1e4), dim=-1)
+        return torch.sum(x * y, dim=-1)
+
+    def propagate_embeddings_attn(self, adj1, adj2, init_emb, weights, prior_emb=None):
+        """Hypergraph propagation with adaptive node-edge attention gates per layer."""
+        embeddings = [init_emb]
+        alpha_layers = []
+        eps = 1e-6
+
+        for _ in range(self.n_layers):
+            edge_emb = torch.sparse.mm(adj2, embeddings[-1])
+            node_msg = torch.sparse.mm(adj1, edge_emb)
+
+            q = self.node_attn_query(embeddings[-1])
+            k = self.node_attn_key(node_msg)
+            logits = torch.sum(q * k, dim=-1) / math.sqrt(self.embedding_dim)
+            logits = logits / max(self.attn_temperature, eps)
+
+            if prior_emb is not None:
+                prior_cos = self._safe_cosine(embeddings[-1], prior_emb)
+                logits = logits + self.attn_prior_weight * prior_cos
+
+            alpha = torch.sigmoid(logits).unsqueeze(1)
+            updated = alpha * node_msg + (1.0 - alpha) * embeddings[-1]
+            embeddings.append(updated)
+            alpha_layers.append(alpha.squeeze(1))
+
+        stacked = torch.stack(embeddings[:self.n_layers], dim=1)
+        w = torch.softmax(weights, dim=0)
+        out = torch.sum(stacked * w.view(1, self.n_layers, 1), dim=1)
+        alpha_stack = torch.stack(alpha_layers, dim=1) if alpha_layers else None
+        return out, alpha_stack
+
+
+    def forward(self, adj_m_c1, adj_m_c2, adj_a_c1, adj_a_c2, adj_m_t1, adj_m_t2, adj_a_t1, adj_a_t2, global_1, global_2,
+                return_attention=False):
+        attention_stats = None
+        if self.use_hypergraph_attention:
+            mashup_call_emb, m_call_alpha = self.propagate_embeddings_attn(
+                adj_m_c1, adj_m_c2, self.mashup_call_embedding.weight, self.u_weights,
+                prior_emb=self.mashup_tag_embedding.weight,
+            )
+            api_call_emb, a_call_alpha = self.propagate_embeddings_attn(
+                adj_a_c1, adj_a_c2, self.api_call_embedding.weight, self.i_weights,
+                prior_emb=self.api_tag_embedding.weight,
+            )
+            mashup_tag_emb, m_tag_alpha = self.propagate_embeddings_attn(
+                adj_m_t1, adj_m_t2, self.mashup_tag_embedding.weight, self.m_t_weights,
+                prior_emb=self.mashup_call_embedding.weight,
+            )
+            api_tag_emb, a_tag_alpha = self.propagate_embeddings_attn(
+                adj_a_t1, adj_a_t2, self.api_tag_embedding.weight, self.a_t_weights,
+                prior_emb=self.api_call_embedding.weight,
+            )
+
+            global_emb, g_alpha = self.propagate_embeddings_attn(
+                global_2, global_1, self.global_embedding.weight, self.global_weights,
+                prior_emb=self.global_embedding.weight,
+            )
+            attention_stats = {
+                'm_call_alpha': m_call_alpha,
+                'a_call_alpha': a_call_alpha,
+                'm_tag_alpha': m_tag_alpha,
+                'a_tag_alpha': a_tag_alpha,
+                'global_alpha': g_alpha,
+            }
+        else:
+            mashup_call_emb = self.propagate_embeddings(adj_m_c1, adj_m_c2, self.mashup_call_embedding.weight, self.u_weights)
+            api_call_emb = self.propagate_embeddings(adj_a_c1, adj_a_c2, self.api_call_embedding.weight, self.i_weights)
+            mashup_tag_emb = self.propagate_embeddings(adj_m_t1, adj_m_t2, self.mashup_tag_embedding.weight, self.m_t_weights)
+            api_tag_emb = self.propagate_embeddings(adj_a_t1, adj_a_t2, self.api_tag_embedding.weight, self.a_t_weights)
+
+            # 全局视角
+            global_emb = self.propagate_embeddings(global_2, global_1, self.global_embedding.weight, self.global_weights)
+        global_mashup = global_emb[:self.n_users]
+        global_api = global_emb[self.n_users:self.n_users+self.n_items]
+        global_tag = global_emb[self.n_users+self.n_items:]
+
+        # Mashup视图融合（调用 + tag）
+        mashup_view_w = torch.softmax(self.mashup_view_weights, dim=0)
+        mashup_emb = mashup_view_w[0] * mashup_call_emb + mashup_view_w[1] * mashup_tag_emb
+        # mashup_final = torch.cat([mashup_emb, global_mashup], dim=1)
+        mashup_l_g_w = torch.softmax(self.mashup_l_g_weights, dim=0)
+        mashup_final = mashup_l_g_w[0] * mashup_emb + mashup_l_g_w[1] * global_mashup
+
+        # API视图融合（调用 + tag）
+        api_view_w = torch.softmax(self.api_view_weights, dim=0)
+        api_emb = api_view_w[0] * api_call_emb + api_view_w[1] * api_tag_emb
+        # api_final = torch.cat([api_emb, global_api], dim=1)
+        api_l_g_w = torch.softmax(self.api_l_g_weights, dim=0)
+        api_final = api_l_g_w[0] * api_emb + api_l_g_w[1] * global_api
+
+        # 对比学习使用的投影表示（Local-level）
+        mashup_call_proj = self.mashup_local_proj(mashup_call_emb)
+        mashup_tag_proj = self.mashup_local_proj(mashup_tag_emb)
+        mashup_local_proj = self.mashup_local_proj(mashup_emb)
+        mashup_global_proj = self.mashup_global_proj(global_mashup)
+
+        api_call_proj = self.api_local_proj(api_call_emb)
+        api_tag_proj = self.api_local_proj(api_tag_emb)
+        api_local_proj = self.api_local_proj(api_emb)
+        api_global_proj = self.api_global_proj(global_api)
+
+        mashup_tag_logits = self.mashup_tag_predictor(mashup_final)
+        api_tag_logits = self.api_tag_predictor(api_final)
+
+        outputs = (mashup_final, api_final,
+                   mashup_call_proj, mashup_tag_proj, api_call_proj, api_tag_proj,
+                   mashup_local_proj, api_local_proj, mashup_global_proj, api_global_proj,
+                   mashup_tag_logits, api_tag_logits)
+
+        if return_attention and attention_stats is not None:
+            return outputs + (attention_stats,)
+        return outputs

@@ -1,0 +1,18 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Virtual envs
+.venv/
+venv/
+
+# Training artifacts and large generated outputs
+CVH-REC/CHV-REC/weights/
+CVH-REC/CHV-REC/DNN_weights/
+CVH-REC/CHV-REC/logs/
+CVH-REC/CHV-REC/nohup.out
+CVH-REC/output/
+output/
+
+# Nested git backups created during repo flattening
+**/.git.backup/
