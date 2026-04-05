@@ -133,9 +133,6 @@ class Model_Wrapper(object):
                 self.layer_num,
                 self.mess_dropout,
                 embedding_dir=self.embedding_dir,
-                use_hypergraph_attention=bool(args.use_hypergraph_attention),
-                attn_temperature=args.attn_temperature,
-                attn_prior_weight=args.attn_prior_weight,
             )
         else:
             raise Exception('Dont know which model to train')
@@ -460,23 +457,13 @@ class Model_Wrapper(object):
 
         self.model.eval()
         with torch.no_grad():
-            if bool(args.use_hypergraph_attention):
-                model_out = self.model(
-                    self.norm_mashup_call_1, self.norm_mashup_call_2,
-                    self.norm_api_call_1, self.norm_api_call_2,
-                    self.norm_mashup_tag_1, self.norm_mashup_tag_2,
-                    self.norm_api_tag_1, self.norm_api_tag_2,
-                    self.global_1, self.global_2,
-                    return_attention=False,
-                )
-            else:
-                model_out = self.model(
-                    self.norm_mashup_call_1, self.norm_mashup_call_2,
-                    self.norm_api_call_1, self.norm_api_call_2,
-                    self.norm_mashup_tag_1, self.norm_mashup_tag_2,
-                    self.norm_api_tag_1, self.norm_api_tag_2,
-                    self.global_1, self.global_2,
-                )
+            model_out = self.model(
+                self.norm_mashup_call_1, self.norm_mashup_call_2,
+                self.norm_api_call_1, self.norm_api_call_2,
+                self.norm_mashup_tag_1, self.norm_mashup_tag_2,
+                self.norm_api_tag_1, self.norm_api_tag_2,
+                self.global_1, self.global_2,
+            )
 
             m_embeddings = model_out[0]
             a_embeddings = model_out[1]
@@ -528,16 +515,11 @@ class Model_Wrapper(object):
 
         for epoch in range(args.epoch):
             t1 = time()
-            attn_warmup_epochs = max(1, int(args.attn_warmup_epochs))
-            attn_warmup_factor = min(1.0, float(epoch + 1) / float(attn_warmup_epochs))
-            current_attn_consistency_weight = args.attn_consistency_weight * attn_warmup_factor
-            current_attn_global_local_weight = args.attn_global_local_weight * attn_warmup_factor
 
             loss, mf_loss, emb_loss, reg_loss = 0., 0., 0., 0.
             mashup_cl_loss, api_cl_loss = 0.0, 0.0
             mashup_global_cl_loss, api_global_cl_loss = 0.0, 0.0
             tag_mashup_loss, tag_api_loss = 0.0, 0.0
-            attn_consistency_loss_sum, attn_global_local_loss_sum = 0.0, 0.0
             n_batch = data_generator.n_train // args.batch_size + 1
             f_time, b_time, loss_time, opt_time, clip_time, emb_time = 0., 0., 0., 0., 0., 0.
             sample_time = 0.
@@ -550,27 +532,14 @@ class Model_Wrapper(object):
                 users, pos_items, neg_items = data_generator.sample()  # 采样正相关与负相关的物品id
                 sample_time += time() - sample_t1
 
-                if args.use_hypergraph_attention:
-                    (m_embeddings, a_embeddings,
-                     m_c_proj, m_t_proj, a_c_proj, a_t_proj,
-                     m_local_proj, a_local_proj, m_global_proj, a_global_proj,
-                     mashup_tag_logits, api_tag_logits,
-                     attention_stats) = (
-                        self.model(self.norm_mashup_call_1, self.norm_mashup_call_2,
-                                   self.norm_api_call_1, self.norm_api_call_2,
-                                   self.norm_mashup_tag_1, self.norm_mashup_tag_2,
-                                   self.norm_api_tag_1, self.norm_api_tag_2,
-                                   self.global_1, self.global_2,
-                                   return_attention=True))
-                else:
-                    (m_embeddings, a_embeddings,
-                     m_c_proj, m_t_proj, a_c_proj, a_t_proj,
-                     m_local_proj, a_local_proj, m_global_proj, a_global_proj,
-                     mashup_tag_logits, api_tag_logits) = (
-                        self.model(self.norm_mashup_call_1, self.norm_mashup_call_2,
-                                   self.norm_api_call_1, self.norm_api_call_2,
-                                   self.norm_mashup_tag_1, self.norm_mashup_tag_2,
-                                   self.norm_api_tag_1, self.norm_api_tag_2, self.global_1, self.global_2))
+                (m_embeddings, a_embeddings,
+                 m_c_proj, m_t_proj, a_c_proj, a_t_proj,
+                 m_local_proj, a_local_proj, m_global_proj, a_global_proj,
+                 mashup_tag_logits, api_tag_logits) = (
+                    self.model(self.norm_mashup_call_1, self.norm_mashup_call_2,
+                               self.norm_api_call_1, self.norm_api_call_2,
+                               self.norm_mashup_tag_1, self.norm_mashup_tag_2,
+                               self.norm_api_tag_1, self.norm_api_tag_2, self.global_1, self.global_2))
 
                 bce_loss_fn = torch.nn.BCEWithLogitsLoss()
 
@@ -606,37 +575,13 @@ class Model_Wrapper(object):
                 batch_loss += cl_loss_weight * batch_mashup_global_cl_loss + cl_loss_weight * batch_api_global_cl_loss
                 batch_loss += batch_mashup_tag_loss + batch_api_tag_loss
 
-                batch_attn_consistency_loss = torch.tensor(0.0, device=self.device)
-                batch_attn_global_local_loss = torch.tensor(0.0, device=self.device)
-                if args.use_hypergraph_attention:
-                    m_call_alpha = attention_stats['m_call_alpha']
-                    m_tag_alpha = attention_stats['m_tag_alpha']
-                    a_call_alpha = attention_stats['a_call_alpha']
-                    a_tag_alpha = attention_stats['a_tag_alpha']
-                    global_alpha = attention_stats['global_alpha']
-
-                    # Cross-view consistency aligns call/tag attention behavior.
-                    batch_attn_consistency_loss = F.mse_loss(m_call_alpha, m_tag_alpha) + F.mse_loss(a_call_alpha, a_tag_alpha)
-
-                    # Local-global regularization discourages over-divergent routing.
-                    m_local_alpha = 0.5 * (m_call_alpha + m_tag_alpha)
-                    a_local_alpha = 0.5 * (a_call_alpha + a_tag_alpha)
-                    g_m_alpha = global_alpha[:self.n_mashup, :]
-                    g_a_alpha = global_alpha[self.n_mashup:self.n_mashup + self.n_api, :]
-                    batch_attn_global_local_loss = F.mse_loss(m_local_alpha, g_m_alpha) + F.mse_loss(a_local_alpha, g_a_alpha)
-
-                    batch_loss += current_attn_consistency_weight * batch_attn_consistency_loss
-                    batch_loss += current_attn_global_local_weight * batch_attn_global_local_loss
-
                 if not torch.isfinite(batch_loss):
                     print(
                         f"WARNING: non-finite batch loss at epoch={epoch}, batch={idx}; skipping batch. "
                         f"mf={float(batch_mf_loss):.6f}, emb={float(batch_emb_loss):.6f}, reg={float(batch_reg_loss):.6f}, "
                         f"m_cl={float(batch_mashup_cl_loss):.6f}, a_cl={float(batch_api_cl_loss):.6f}, "
                         f"m_g_cl={float(batch_mashup_global_cl_loss):.6f}, a_g_cl={float(batch_api_global_cl_loss):.6f}, "
-                        f"m_tag={float(batch_mashup_tag_loss):.6f}, a_tag={float(batch_api_tag_loss):.6f}, "
-                        f"attn_cons={float(batch_attn_consistency_loss):.6f}, "
-                        f"attn_gl={float(batch_attn_global_local_loss):.6f}"
+                        f"m_tag={float(batch_mashup_tag_loss):.6f}, a_tag={float(batch_api_tag_loss):.6f}"
                     )
                     self.optimizer.zero_grad(set_to_none=True)
                     continue
@@ -658,8 +603,6 @@ class Model_Wrapper(object):
 
                 tag_mashup_loss += float(batch_mashup_tag_loss)
                 tag_api_loss += float(batch_api_tag_loss)
-                attn_consistency_loss_sum += float(batch_attn_consistency_loss)
-                attn_global_local_loss_sum += float(batch_attn_global_local_loss)
 
             avg_loss = loss / max(1, n_batch)
             metric_name = str(args.early_stop_metric).lower()
@@ -703,9 +646,6 @@ class Model_Wrapper(object):
                         f"mashup_cl_loss={mashup_cl_loss:.5f}, api_cl_loss={api_cl_loss:.5f}, "
                         f"mashup_global_cl_loss={mashup_global_cl_loss:.5f}, api_global_cl_loss={api_global_cl_loss:.5f}, "
                         f"tag_mashup_loss={tag_mashup_loss:.5f}, tag_api_loss={tag_api_loss:.5f}, "
-                        f"attn_consistency={attn_consistency_loss_sum:.5f}, "
-                        f"attn_global_local={attn_global_local_loss_sum:.5f}, "
-                        f"attn_warmup_factor={attn_warmup_factor:.3f}, "
                         f"hard_neg_start={args.hard_negative_start_epoch}"
                     )
                     print(perf_str)

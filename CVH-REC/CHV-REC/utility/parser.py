@@ -40,7 +40,7 @@ def parse_args():
                         help='Base directory for storing/loading text embedding h5 files.')
     parser.add_argument('--log_dir', nargs='?', default='logs',
                         help='Directory for per-run log files.')
-    parser.add_argument('--layer_num', type=int, default=3,
+    parser.add_argument('--layer_num', type=int, default=3, # 1 to 6
                         help='Output sizes of every layer')
     parser.add_argument('--batch_size', type=int, default=512,
                         help='Batch size.')
@@ -53,16 +53,6 @@ def parse_args():
     parser.add_argument('--adj_type', nargs='?', default='norm_adj',
                         help='Specify the type of the adjacency (laplacian) matrix from {plain, norm, mean}.')
     parser.add_argument('--alg_type', nargs='?', default='hcf')
-    parser.add_argument('--use_hypergraph_attention', type=int, default=0,
-                        help='Enable adaptive hypergraph attention gates (0/1).')
-    parser.add_argument('--attn_temperature', type=float, default=0.7,
-                        help='Temperature for attention logits.')
-    parser.add_argument('--attn_prior_weight', type=float, default=0.2,
-                        help='Weight of text-guided prior in attention logits.')
-    parser.add_argument('--attn_consistency_weight', type=float, default=0.05,
-                        help='Weight for cross-view attention consistency regularization.')
-    parser.add_argument('--attn_global_local_weight', type=float, default=0.03,
-                        help='Weight for local-global attention regularization.')
     parser.add_argument('--use_hard_negative_sampling', type=int, default=1,
                         help='Enable hard negative sampling during graph model training (0/1).')
     parser.add_argument('--hard_negative_ratio', type=float, default=0.5,
@@ -79,8 +69,6 @@ def parse_args():
                         help='Weight for ranking (BPR) loss in text encoder training.')
     parser.add_argument('--hard_negative_start_epoch', type=int, default=30,
                         help='Enable hard negative sampling only after this epoch.')
-    parser.add_argument('--attn_warmup_epochs', type=int, default=40,
-                        help='Warmup epochs for ramping attention regularization weights.')
     parser.add_argument('--text_rank_start_epoch', type=int, default=20,
                         help='Start epoch for enabling text ranking loss.')
     parser.add_argument('--text_rank_warmup_epochs', type=int, default=40,

@@ -1,5 +1,4 @@
 import h5py
-import math
 import os
 import torch
 import torch.nn as nn
@@ -23,8 +22,7 @@ class ProjectionMLP(nn.Module):
 
 class HCF(nn.Module):
     def __init__(self, n_users, n_items, n_tags,
-                 embedding_dim, layer_num, dropout_list, embedding_dir='data',
-                 use_hypergraph_attention=False, attn_temperature=0.7, attn_prior_weight=0.2):
+                 embedding_dim, layer_num, dropout_list, embedding_dir='data'):
         super().__init__()
         self.n_users = n_users
         self.n_items = n_items
@@ -33,9 +31,6 @@ class HCF(nn.Module):
 
         self.embedding_dim = embedding_dim
         self.n_layers = layer_num
-        self.use_hypergraph_attention = bool(use_hypergraph_attention)
-        self.attn_temperature = float(attn_temperature)
-        self.attn_prior_weight = float(attn_prior_weight)
 
         # torch.manual_seed(50)
 
@@ -47,10 +42,6 @@ class HCF(nn.Module):
         self.api_tag_embedding = nn.Embedding(n_items, embedding_dim)
 
         self.global_embedding = nn.Embedding(n_users + n_items + n_tags, embedding_dim)
-
-        # Lightweight node-edge attention gates for each relation view.
-        self.node_attn_query = nn.Linear(self.embedding_dim, self.embedding_dim, bias=False)
-        self.node_attn_key = nn.Linear(self.embedding_dim, self.embedding_dim, bias=False)
 
         self.dropout_list = nn.ModuleList([nn.Dropout(p) for p in dropout_list])
 
@@ -137,82 +128,14 @@ class HCF(nn.Module):
         out = torch.sum(stacked * w.view(1, self.n_layers, 1), dim=1)
         return out
 
-    def _safe_cosine(self, x, y):
-        x = F.normalize(torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4), dim=-1)
-        y = F.normalize(torch.nan_to_num(y, nan=0.0, posinf=1e4, neginf=-1e4), dim=-1)
-        return torch.sum(x * y, dim=-1)
+    def forward(self, adj_m_c1, adj_m_c2, adj_a_c1, adj_a_c2, adj_m_t1, adj_m_t2, adj_a_t1, adj_a_t2, global_1, global_2):
+        mashup_call_emb = self.propagate_embeddings(adj_m_c1, adj_m_c2, self.mashup_call_embedding.weight, self.u_weights)
+        api_call_emb = self.propagate_embeddings(adj_a_c1, adj_a_c2, self.api_call_embedding.weight, self.i_weights)
+        mashup_tag_emb = self.propagate_embeddings(adj_m_t1, adj_m_t2, self.mashup_tag_embedding.weight, self.m_t_weights)
+        api_tag_emb = self.propagate_embeddings(adj_a_t1, adj_a_t2, self.api_tag_embedding.weight, self.a_t_weights)
 
-    def propagate_embeddings_attn(self, adj1, adj2, init_emb, weights, prior_emb=None):
-        """Hypergraph propagation with adaptive node-edge attention gates per layer."""
-        embeddings = [init_emb]
-        alpha_layers = []
-        eps = 1e-6
-
-        for _ in range(self.n_layers):
-            edge_emb = torch.sparse.mm(adj2, embeddings[-1])
-            node_msg = torch.sparse.mm(adj1, edge_emb)
-
-            q = self.node_attn_query(embeddings[-1])
-            k = self.node_attn_key(node_msg)
-            logits = torch.sum(q * k, dim=-1) / math.sqrt(self.embedding_dim)
-            logits = logits / max(self.attn_temperature, eps)
-
-            if prior_emb is not None:
-                prior_cos = self._safe_cosine(embeddings[-1], prior_emb)
-                logits = logits + self.attn_prior_weight * prior_cos
-
-            alpha = torch.sigmoid(logits).unsqueeze(1)
-            updated = alpha * node_msg + (1.0 - alpha) * embeddings[-1]
-            embeddings.append(updated)
-            alpha_layers.append(alpha.squeeze(1))
-
-        stacked = torch.stack(embeddings[:self.n_layers], dim=1)
-        w = torch.softmax(weights, dim=0)
-        out = torch.sum(stacked * w.view(1, self.n_layers, 1), dim=1)
-        alpha_stack = torch.stack(alpha_layers, dim=1) if alpha_layers else None
-        return out, alpha_stack
-
-
-    def forward(self, adj_m_c1, adj_m_c2, adj_a_c1, adj_a_c2, adj_m_t1, adj_m_t2, adj_a_t1, adj_a_t2, global_1, global_2,
-                return_attention=False):
-        attention_stats = None
-        if self.use_hypergraph_attention:
-            mashup_call_emb, m_call_alpha = self.propagate_embeddings_attn(
-                adj_m_c1, adj_m_c2, self.mashup_call_embedding.weight, self.u_weights,
-                prior_emb=self.mashup_tag_embedding.weight,
-            )
-            api_call_emb, a_call_alpha = self.propagate_embeddings_attn(
-                adj_a_c1, adj_a_c2, self.api_call_embedding.weight, self.i_weights,
-                prior_emb=self.api_tag_embedding.weight,
-            )
-            mashup_tag_emb, m_tag_alpha = self.propagate_embeddings_attn(
-                adj_m_t1, adj_m_t2, self.mashup_tag_embedding.weight, self.m_t_weights,
-                prior_emb=self.mashup_call_embedding.weight,
-            )
-            api_tag_emb, a_tag_alpha = self.propagate_embeddings_attn(
-                adj_a_t1, adj_a_t2, self.api_tag_embedding.weight, self.a_t_weights,
-                prior_emb=self.api_call_embedding.weight,
-            )
-
-            global_emb, g_alpha = self.propagate_embeddings_attn(
-                global_2, global_1, self.global_embedding.weight, self.global_weights,
-                prior_emb=self.global_embedding.weight,
-            )
-            attention_stats = {
-                'm_call_alpha': m_call_alpha,
-                'a_call_alpha': a_call_alpha,
-                'm_tag_alpha': m_tag_alpha,
-                'a_tag_alpha': a_tag_alpha,
-                'global_alpha': g_alpha,
-            }
-        else:
-            mashup_call_emb = self.propagate_embeddings(adj_m_c1, adj_m_c2, self.mashup_call_embedding.weight, self.u_weights)
-            api_call_emb = self.propagate_embeddings(adj_a_c1, adj_a_c2, self.api_call_embedding.weight, self.i_weights)
-            mashup_tag_emb = self.propagate_embeddings(adj_m_t1, adj_m_t2, self.mashup_tag_embedding.weight, self.m_t_weights)
-            api_tag_emb = self.propagate_embeddings(adj_a_t1, adj_a_t2, self.api_tag_embedding.weight, self.a_t_weights)
-
-            # 全局视角
-            global_emb = self.propagate_embeddings(global_2, global_1, self.global_embedding.weight, self.global_weights)
+        # 全局视角
+        global_emb = self.propagate_embeddings(global_2, global_1, self.global_embedding.weight, self.global_weights)
         global_mashup = global_emb[:self.n_users]
         global_api = global_emb[self.n_users:self.n_users+self.n_items]
         global_tag = global_emb[self.n_users+self.n_items:]
@@ -249,7 +172,4 @@ class HCF(nn.Module):
                    mashup_call_proj, mashup_tag_proj, api_call_proj, api_tag_proj,
                    mashup_local_proj, api_local_proj, mashup_global_proj, api_global_proj,
                    mashup_tag_logits, api_tag_logits)
-
-        if return_attention and attention_stats is not None:
-            return outputs + (attention_stats,)
         return outputs
