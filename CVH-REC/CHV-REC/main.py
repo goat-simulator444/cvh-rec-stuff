@@ -17,18 +17,12 @@ from time import time
 import torch.sparse as sparse
 from utility.parser import parse_args
 from utility.text_model_utils import (
-    build_log_path,
     embedding_dir,
     resolve_embed_size,
     resolve_embedding_file,
-    setup_run_logging,
     text_model_tag,
 )
 args = parse_args()
-
-_RUN_LOG_FP = setup_run_logging(
-    build_log_path(args.log_dir, 'main', 'CVH-REC', args.dataset, args.text_model)
-)
 
 warnings.filterwarnings("ignore")
 
@@ -156,7 +150,6 @@ class Model_Wrapper(object):
             args.data_path + args.dataset + '/api_tags.csv',
             self.n_api, self.n_tag
         )
-        self.validation_ground_truth = self.load_eval_pairs(args.data_path + args.dataset + '/VA.csv')
 
         self.model = self.model.to(self.device)
         self.norm_mashup_call_1 = self.norm_mashup_call_1.to(self.device)
@@ -393,106 +386,6 @@ class Model_Wrapper(object):
                         labels[entity_id, tag_id] = 1.0
         return torch.FloatTensor(labels)
 
-    def load_eval_pairs(self, file_path):
-        pairs = {}
-        if not os.path.exists(file_path):
-            return pairs
-        with open(file_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                parts = line.strip().split()
-                if not parts:
-                    continue
-                uid = int(parts[0])
-                items = set(map(int, parts[1:]))
-                pairs[uid] = items
-        return pairs
-
-    def _mine_hard_negatives(self, users, random_neg_items, u_embeddings, a_embeddings, epoch):
-        if not bool(args.use_hard_negative_sampling):
-            return random_neg_items
-        if epoch < max(0, int(args.hard_negative_start_epoch)):
-            return random_neg_items
-
-        hard_ratio = max(0.0, min(1.0, float(args.hard_negative_ratio)))
-        if hard_ratio <= 0.0:
-            return random_neg_items
-
-        candidate_size = max(10, int(args.hard_negative_candidates))
-        mixed_neg_items = list(random_neg_items)
-
-        for idx, u in enumerate(users):
-            if random.random() > hard_ratio:
-                continue
-
-            user_train = data_generator.train_items.get(u, [])
-            train_set = set(user_train)
-            if len(train_set) >= self.n_api - 1:
-                continue
-
-            # Randomly sample candidate negatives, then pick the highest-scoring one.
-            candidates = set()
-            attempts = 0
-            max_attempts = candidate_size * 5
-            while len(candidates) < candidate_size and attempts < max_attempts:
-                neg_id = np.random.randint(low=0, high=self.n_api, size=1)[0]
-                if neg_id not in train_set:
-                    candidates.add(int(neg_id))
-                attempts += 1
-
-            if not candidates:
-                continue
-
-            candidate_list = list(candidates)
-            item_vecs = a_embeddings[candidate_list]
-            user_vec = u_embeddings[idx].unsqueeze(0)
-            scores = torch.matmul(user_vec, item_vecs.T).squeeze(0)
-            hard_idx = int(torch.argmax(scores).item())
-            mixed_neg_items[idx] = candidate_list[hard_idx]
-
-        return mixed_neg_items
-
-    def evaluate_recall_at_5(self):
-        if not self.validation_ground_truth:
-            return 0.0
-
-        self.model.eval()
-        with torch.no_grad():
-            model_out = self.model(
-                self.norm_mashup_call_1, self.norm_mashup_call_2,
-                self.norm_api_call_1, self.norm_api_call_2,
-                self.norm_mashup_tag_1, self.norm_mashup_tag_2,
-                self.norm_api_tag_1, self.norm_api_tag_2,
-                self.global_1, self.global_2,
-            )
-
-            m_embeddings = model_out[0]
-            a_embeddings = model_out[1]
-            users = list(self.validation_ground_truth.keys())
-            if not users:
-                return 0.0
-
-            user_vecs = m_embeddings[users]
-            score_matrix = torch.matmul(user_vecs, a_embeddings.T)
-
-            # Mask training items to avoid recommending known interactions.
-            for row_idx, u in enumerate(users):
-                train_items = data_generator.train_items.get(u, [])
-                if train_items:
-                    score_matrix[row_idx, train_items] = -1e9
-
-            top_k = 5
-            topk_indices = torch.topk(score_matrix, top_k, dim=1).indices.cpu().numpy()
-
-            recalls = []
-            for row_idx, u in enumerate(users):
-                gt = self.validation_ground_truth.get(u, set())
-                if not gt:
-                    continue
-                pred = set(topk_indices[row_idx])
-                recalls.append(len(pred & gt) / max(1, len(gt)))
-
-            return float(np.mean(recalls)) if recalls else 0.0
-
     def set_lr_scheduler(self):  # lr_scheduler：学习率调度器
         fac = lamb
         scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=fac)
@@ -510,7 +403,6 @@ class Model_Wrapper(object):
         patience = args.patience  # 容忍多少个 epoch 没提升
         no_improve_count = 0
         best_loss = float('inf')  # 初始化最优 loss
-        best_recall5 = -1.0
         best_epoch = -1  # 记录最佳 epoch
 
         for epoch in range(args.epoch):
@@ -521,6 +413,7 @@ class Model_Wrapper(object):
             mashup_global_cl_loss, api_global_cl_loss = 0.0, 0.0
             tag_mashup_loss, tag_api_loss = 0.0, 0.0
             n_batch = data_generator.n_train // args.batch_size + 1
+            valid_batches = 0
             f_time, b_time, loss_time, opt_time, clip_time, emb_time = 0., 0., 0., 0., 0., 0.
             sample_time = 0.
 
@@ -549,7 +442,6 @@ class Model_Wrapper(object):
 
                 u_g_embeddings = m_embeddings[users]
                 pos_i_g_embeddings = a_embeddings[pos_items]
-                neg_items = self._mine_hard_negatives(users, neg_items, u_g_embeddings, a_embeddings, epoch)
                 neg_i_g_embeddings = a_embeddings[neg_items]
 
                 batch_mf_loss, batch_emb_loss, batch_reg_loss = self.bpr_loss(u_g_embeddings, pos_i_g_embeddings,
@@ -589,6 +481,7 @@ class Model_Wrapper(object):
                 batch_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
                 self.optimizer.step()
+                valid_batches += 1
 
                 loss += float(batch_loss)
                 mf_loss += float(batch_mf_loss)
@@ -604,21 +497,8 @@ class Model_Wrapper(object):
                 tag_mashup_loss += float(batch_mashup_tag_loss)
                 tag_api_loss += float(batch_api_tag_loss)
 
-            avg_loss = loss / max(1, n_batch)
-            metric_name = str(args.early_stop_metric).lower()
-            if metric_name == 'recall5' and (epoch + 1) % max(1, args.val_interval) == 0:
-                val_recall5 = self.evaluate_recall_at_5()
-                if val_recall5 > best_recall5:
-                    best_recall5 = val_recall5
-                    no_improve_count = 0
-                    best_epoch = epoch
-                    if args.save_flag == 1:
-                        self.save_model()
-                else:
-                    no_improve_count += 1
-
-                print(f"Validation Recall@5 at epoch {epoch}: {val_recall5:.6f} (best={best_recall5:.6f})")
-            elif metric_name == 'loss':
+            if epoch > 150:
+                avg_loss = loss / max(1, valid_batches)
                 if avg_loss < best_loss:
                     best_loss = avg_loss
                     no_improve_count = 0
@@ -628,12 +508,10 @@ class Model_Wrapper(object):
                 else:
                     no_improve_count += 1
 
-            if epoch >= max(0, int(args.early_stop_start_epoch)) and no_improve_count >= patience:
-                if metric_name == 'recall5':
-                    print(f"⏹️ Early stopping triggered at epoch {epoch}. Best Recall@5 = {best_recall5:.6f} (epoch {best_epoch})")
-                else:
-                    print(f"⏹️ Early stopping triggered at epoch {epoch}. Best loss = {best_loss:.5f} (epoch {best_epoch})")
-                break
+                if no_improve_count >= patience:
+                    print(
+                        f"⏹️ Early stopping triggered at epoch {epoch}. Best loss = {best_loss:.5f} (epoch {best_epoch})")
+                    break
 
             self.lr_scheduler.step()  # 学习率更新
 
@@ -645,14 +523,13 @@ class Model_Wrapper(object):
                         f"loss={loss:.5f}, mf_loss={mf_loss:.5f}, "
                         f"mashup_cl_loss={mashup_cl_loss:.5f}, api_cl_loss={api_cl_loss:.5f}, "
                         f"mashup_global_cl_loss={mashup_global_cl_loss:.5f}, api_global_cl_loss={api_global_cl_loss:.5f}, "
-                        f"tag_mashup_loss={tag_mashup_loss:.5f}, tag_api_loss={tag_api_loss:.5f}, "
-                        f"hard_neg_start={args.hard_negative_start_epoch}"
+                        f"tag_mashup_loss={tag_mashup_loss:.5f}, tag_api_loss={tag_api_loss:.5f}"
                     )
                     print(perf_str)
 
             if not math.isfinite(loss):
-                print('ERROR: epoch loss is non-finite (nan/inf).')
-                sys.exit(1)
+                print('WARNING: epoch loss is non-finite (nan/inf). Continue to next epoch.')
+                continue
 
         # *********************************************************
         # save the user & item embeddings for pretraining.

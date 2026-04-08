@@ -2,7 +2,6 @@ import h5py
 import os
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class ProjectionMLP(nn.Module):
@@ -74,7 +73,7 @@ class HCF(nn.Module):
 
     def load_pretrained_embeddings(self, num, file):
         data = []
-        # Open the HDF5 file once to avoid repeated low-level open/close calls.
+        # Open the HDF5 file once to avoid repeated open/close calls.
         with h5py.File(file, 'r') as f:
             for i in range(num):
                 key = str(i)
@@ -128,6 +127,7 @@ class HCF(nn.Module):
         out = torch.sum(stacked * w.view(1, self.n_layers, 1), dim=1)
         return out
 
+
     def forward(self, adj_m_c1, adj_m_c2, adj_a_c1, adj_a_c2, adj_m_t1, adj_m_t2, adj_a_t1, adj_a_t2, global_1, global_2):
         mashup_call_emb = self.propagate_embeddings(adj_m_c1, adj_m_c2, self.mashup_call_embedding.weight, self.u_weights)
         api_call_emb = self.propagate_embeddings(adj_a_c1, adj_a_c2, self.api_call_embedding.weight, self.i_weights)
@@ -168,8 +168,7 @@ class HCF(nn.Module):
         mashup_tag_logits = self.mashup_tag_predictor(mashup_final)
         api_tag_logits = self.api_tag_predictor(api_final)
 
-        outputs = (mashup_final, api_final,
-                   mashup_call_proj, mashup_tag_proj, api_call_proj, api_tag_proj,
-                   mashup_local_proj, api_local_proj, mashup_global_proj, api_global_proj,
-                   mashup_tag_logits, api_tag_logits)
-        return outputs
+        return (mashup_final, api_final,
+                mashup_call_proj, mashup_tag_proj, api_call_proj, api_tag_proj,
+                mashup_local_proj, api_local_proj, mashup_global_proj, api_global_proj,
+                mashup_tag_logits, api_tag_logits)

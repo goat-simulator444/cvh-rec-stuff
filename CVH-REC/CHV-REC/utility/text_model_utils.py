@@ -1,5 +1,4 @@
 import os
-import sys
 
 
 _ALIAS_TO_CANONICAL = {
@@ -94,32 +93,3 @@ def resolve_embedding_file(base_dir, text_model, file_name):
         return model_scoped_path
     # Backward compatibility with older layout under data/*.h5
     return os.path.join(base_dir, file_name)
-
-
-def build_log_path(log_dir, script_stem, method, dataset, text_model):
-    os.makedirs(log_dir, exist_ok=True)
-    return os.path.join(
-        log_dir,
-        f"{script_stem}_{method}_{text_model_tag(text_model)}_{dataset}.log",
-    )
-
-
-class TeeStream:
-    def __init__(self, stream_a, stream_b):
-        self.stream_a = stream_a
-        self.stream_b = stream_b
-
-    def write(self, data):
-        self.stream_a.write(data)
-        self.stream_b.write(data)
-
-    def flush(self):
-        self.stream_a.flush()
-        self.stream_b.flush()
-
-
-def setup_run_logging(log_path):
-    log_fp = open(log_path, "a", encoding="utf-8")
-    sys.stdout = TeeStream(sys.stdout, log_fp)
-    sys.stderr = TeeStream(sys.stderr, log_fp)
-    return log_fp

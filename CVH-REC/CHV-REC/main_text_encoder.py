@@ -18,18 +18,12 @@ from time import time
 import torch.sparse as sparse
 from utility.parser import parse_args
 from utility.text_model_utils import (
-    build_log_path,
     embedding_dir,
     resolve_embed_size,
     resolve_embedding_file,
-    setup_run_logging,
     text_model_tag,
 )
 args = parse_args()
-
-_RUN_LOG_FP = setup_run_logging(
-    build_log_path(args.log_dir, 'main_text_encoder', args.method, args.dataset, args.text_model)
-)
 warnings.filterwarnings("ignore")
 
 if args.method == "CVH-REC":
@@ -121,10 +115,8 @@ class Model_Wrapper(object):
         self.embedding_dir = embedding_dir(args.embedding_base_dir, args.text_model)
         if not os.path.exists(self.embedding_dir):
             self.embedding_dir = args.embedding_base_dir
-        self.user_text_embeddings = self.load_all_user_text_embeddings(
-            n_users=7163,
-            h5_path=resolve_embedding_file(args.embedding_base_dir, args.text_model, 'vectors.h5')
-        ).to(self.device)
+        self.user_text_embeddings = self.load_all_user_text_embeddings(n_users=7163,
+                                                                       h5_path=resolve_embedding_file(args.embedding_base_dir, args.text_model, 'vectors.h5')).to(self.device)
 
         print('model_type is {}'.format(self.model_type))
 
@@ -153,15 +145,26 @@ class Model_Wrapper(object):
         print('----self.alg_type is {}----'.format(self.alg_type))
 
         if self.alg_type in ['hcf']:
-            self.model = HCF(
-                self.n_mashup,
-                self.n_api,
-                self.n_tag,
-                self.emb_dim,
-                self.layer_num,
-                self.mess_dropout,
-                embedding_dir=self.embedding_dir,
-            )
+            try:
+                self.model = HCF(
+                    self.n_mashup,
+                    self.n_api,
+                    self.n_tag,
+                    self.emb_dim,
+                    self.layer_num,
+                    self.mess_dropout,
+                    embedding_dir=self.embedding_dir,
+                )
+            except TypeError:
+                # Keep backward compatibility for ablation model files that still use the old constructor.
+                self.model = HCF(
+                    self.n_mashup,
+                    self.n_api,
+                    self.n_tag,
+                    self.emb_dim,
+                    self.layer_num,
+                    self.mess_dropout,
+                )
             self.text_encoder = UserTextEncoder(dim=self.emb_dim, dropout_rate=0.2)
         else:
             raise Exception('Dont know which model to train')
@@ -560,18 +563,11 @@ class Model_Wrapper(object):
         best_epoch = -1  # 记录最佳 epoch
         for epoch in range(args.epoch):
             t1 = time()
-            rank_start = max(0, int(args.text_rank_start_epoch))
-            rank_warmup = max(1, int(args.text_rank_warmup_epochs))
-            if epoch < rank_start:
-                current_rank_weight = 0.0
-            else:
-                rank_factor = min(1.0, float(epoch - rank_start + 1) / float(rank_warmup))
-                current_rank_weight = args.text_rank_weight * rank_factor
 
             loss, text_loss = 0., 0.
-            rank_loss_sum, align_loss_sum = 0.0, 0.0
 
             n_batch = data_generator.n_train // args.batch_size + 1
+            valid_batches = 0
             sample_time = 0.
 
             for idx in range(n_batch):
@@ -581,26 +577,17 @@ class Model_Wrapper(object):
 
                 sample_time += time() - sample_t1
                 u_g_embeddings = m_embeddings[users]
+                u_g_embeddings = torch.nan_to_num(u_g_embeddings, nan=0.0, posinf=1e4, neginf=-1e4)
 
                 # =====================对比学习 =============================
 
-                batch_user_text_vecs = self.user_text_embeddings[users].to(self.device)  # shape = (batch_size, 768)
+                batch_user_text_vecs = self.user_text_embeddings[users].to(self.device)  # shape = (batch_size, dim)
                 batch_user_text_vecs = torch.nan_to_num(batch_user_text_vecs, nan=0.0, posinf=1e4, neginf=-1e4)
-                u_g_embeddings = torch.nan_to_num(u_g_embeddings, nan=0.0, posinf=1e4, neginf=-1e4)
                 enhanced_user_vecs = self.text_encoder(batch_user_text_vecs)
                 enhanced_user_vecs = torch.nan_to_num(enhanced_user_vecs, nan=0.0, posinf=1e4, neginf=-1e4)
 
-                align_loss = F.mse_loss(enhanced_user_vecs, u_g_embeddings)
-
-                pos_api_emb = a_embeddings[pos_items]
-                neg_api_emb = a_embeddings[neg_items]
-                pos_scores = torch.sum(enhanced_user_vecs * pos_api_emb, dim=1)
-                neg_scores = torch.sum(enhanced_user_vecs * neg_api_emb, dim=1)
-                rank_loss = -torch.mean(F.logsigmoid(pos_scores - neg_scores))
-
-                total_text_loss = args.text_align_weight * align_loss + current_rank_weight * rank_loss
-
-                if not torch.isfinite(total_text_loss):
+                contrastive_loss = F.mse_loss(enhanced_user_vecs, u_g_embeddings)
+                if not torch.isfinite(contrastive_loss):
                     print(
                         f"WARNING: non-finite text loss at epoch={epoch}, batch={idx}; skipping batch. "
                         f"mean|u|={float(u_g_embeddings.abs().mean()):.6f}, mean|enhanced|={float(enhanced_user_vecs.abs().mean()):.6f}"
@@ -608,15 +595,14 @@ class Model_Wrapper(object):
                     self.optimizer.zero_grad(set_to_none=True)
                     continue
                 self.optimizer.zero_grad()
-                total_text_loss.backward()
+                contrastive_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.text_encoder.parameters(), max_norm=5.0)
                 self.optimizer.step()
 
 
-                loss += float(total_text_loss)
-                rank_loss_sum += float(rank_loss)
-                align_loss_sum += float(align_loss)
-            avg_loss = loss / n_batch
+                loss += float(contrastive_loss)
+                valid_batches += 1
+            avg_loss = loss / max(1, valid_batches)
 
             self.lr_scheduler.step()  # 学习率更新
 
@@ -643,8 +629,7 @@ class Model_Wrapper(object):
                 if args.verbose > 0 and epoch % args.verbose == 0:
                     perf_str = (
                         f"Epoch {epoch} [{time() - t1:.1f}s]: "
-                        f"loss={loss:.5f}, align_loss={align_loss_sum:.5f}, rank_loss={rank_loss_sum:.5f}, "
-                        f"current_rank_weight={current_rank_weight:.4f}"
+                        f"loss={loss:.5f}"
                     )
                     print(perf_str)
         if args.save_flag == 1:
@@ -907,38 +892,37 @@ class Model_Wrapper(object):
 
 
     def contrastive_loss(self, z1, z2, temperature=0.5):
-        # 数值稳定版本：先清理非有限值，再用 logsumexp 避免 exp/log 下溢或上溢
-        z1 = torch.nan_to_num(z1, nan=0.0, posinf=1e4, neginf=-1e4)
-        z2 = torch.nan_to_num(z2, nan=0.0, posinf=1e4, neginf=-1e4)
-        z1 = torch.clamp(z1, min=-1e4, max=1e4)
-        z2 = torch.clamp(z2, min=-1e4, max=1e4)
-
+        # 保留原始向量，不归一化
         N = z1.size(0)
-        if N == 0:
-            return torch.tensor(0.0, device=z1.device)
 
         # 正样本距离
         pos_dist = torch.norm(z1 - z2, p=2, dim=1)  # [N]
-        pos_dist = torch.clamp(pos_dist, min=0.0, max=1e6)
         sim_pos = -pos_dist / temperature
 
-        # 计算 pairwise 距离矩阵
+        # 计算 pairwise 距离的平方（高效）
         z1_sq = (z1 ** 2).sum(dim=1).unsqueeze(1)  # [N, 1]
         z2_sq = (z2 ** 2).sum(dim=1).unsqueeze(0)  # [1, N]
         dot_product = torch.matmul(z1, z2.T)  # [N, N]
+
+        # 欧几里得距离平方
         dist_squared = z1_sq + z2_sq - 2 * dot_product
-        dist_squared = torch.clamp(dist_squared, min=1e-12, max=1e12)
+        dist_squared = torch.clamp(dist_squared, min=1e-8)  # 避免负数误差
+
+        # 取平方根，得到距离矩阵
         dist_matrix = torch.sqrt(dist_squared)  # [N, N]
 
-        # 转为负相似度并屏蔽正样本
+        # 转为负相似度
         logits_zw = -dist_matrix / temperature
-        mask = torch.eye(N, dtype=torch.bool, device=z1.device)
-        logits_zw = logits_zw.masked_fill(mask, float('-inf'))
 
-        # InfoNCE: -sim_pos + log(exp(sim_pos) + sum exp(neg))，用 logsumexp 稳定计算
-        all_logits = torch.cat([sim_pos.unsqueeze(1), logits_zw], dim=1)
-        log_denom = torch.logsumexp(all_logits, dim=1)
-        loss = log_denom - sim_pos
+        # 屏蔽正样本
+        mask = torch.eye(N, dtype=torch.bool).to(z1.device)
+        logits_zw.masked_fill_(mask, -1e9)
+
+        # 分母：所有负样本
+        denom = torch.exp(logits_zw).sum(dim=1)
+
+        # 最终损失
+        loss = - torch.log(torch.exp(sim_pos) / (torch.exp(sim_pos) + denom + 1e-8))
         return loss.mean()
 
     def sparse_mx_to_torch_sparse_tensor(self, sparse_mx):

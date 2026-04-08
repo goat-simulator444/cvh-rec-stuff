@@ -1,6 +1,0 @@
-Graph Attention Status
-======================
-
-All attention-related mechanisms and runtime flags have been removed from the active CHV-REC code path.
-
-Current model behavior uses fixed hypergraph propagation only.

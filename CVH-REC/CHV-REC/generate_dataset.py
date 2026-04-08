@@ -11,29 +11,38 @@ from utility.text_model_utils import embedding_dir, resolve_text_model_name, tex
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Generate CVH-REC dataset and text vectors.")
+    parser = argparse.ArgumentParser(description="Generate CVH-REC dataset and text embeddings.")
     parser.add_argument(
         "--text_model",
         default="mpnet",
-        help="Model alias/name. Supported aliases: mpnet, bge-base, bge-large, e5-base (or e5bse), e5-large, gte-base, gte-large, all.",
+        help="Text model alias or HF name (e.g., mpnet, bge-base, bge-large, e5-base, e5-large, gte-base, gte-large).",
     )
     parser.add_argument(
         "--embedding_base_dir",
         default="data",
-        help="Base directory where per-model embedding folders are created.",
+        help="Base directory used to store encoder-specific h5 embedding files.",
     )
     return parser.parse_args()
 
 
-def load_source_data():
+def save_vectors_h5(model, filename, id_to_text):
+    with h5py.File(filename, "w") as f:
+        for id_, text in id_to_text.items():
+            vec = model.encode(text)
+            f.create_dataset(str(id_), data=vec.astype(np.float32))
+
+
+def main():
+    args = parse_args()
+
+    # Load source data.
     with open("Original Dataset/mashup_shuffled.json", "r", encoding="utf-8") as f:
         mashups = json.load(f)
+
     with open("Original Dataset/apis.json", "r", encoding="utf-8") as f:
         apis = json.load(f)
-    return mashups, apis
 
-
-def build_tag_maps(mashups, apis):
+    # Build tag dictionaries.
     api_id_to_tags = {}
     all_api_tags = set()
     for api in apis:
@@ -47,49 +56,34 @@ def build_tag_maps(mashups, apis):
     all_mashup_tags = set()
     for mashup in mashups:
         mashup_id = mashup["id"]
-        categories = [c.strip() for c in mashup["categories"].split(",") if c.strip()]
-        mashup_id_to_tags[mashup_id] = categories
-        all_mashup_tags.update(categories)
+        cats = [c.strip() for c in mashup["categories"].split(",") if c.strip()]
+        mashup_id_to_tags[mashup_id] = cats
+        all_mashup_tags.update(cats)
 
     all_tags = all_api_tags.union(all_mashup_tags)
     tag2id = {tag: i for i, tag in enumerate(sorted(all_tags))}
-    return api_id_to_tags, mashup_id_to_tags, tag2id
 
+    model_name = resolve_text_model_name(args.text_model)
+    model_tag = text_model_tag(args.text_model)
+    print(f"Using text model: {model_name} (tag={model_tag})")
 
-def save_vectors_h5(model, filename, id_to_text):
-    with h5py.File(filename, "w") as f:
-        for id_, text in id_to_text.items():
-            vec = model.encode(text)
-            f.create_dataset(str(id_), data=vec.astype(np.float32))
+    # Keep embeddings isolated per text model to avoid dimension collisions.
+    model_embedding_dir = embedding_dir(args.embedding_base_dir, args.text_model)
+    os.makedirs(model_embedding_dir, exist_ok=True)
 
-
-def generate_embeddings(mashups, apis, tag2id, text_model, embedding_base_dir):
-    model_name = resolve_text_model_name(text_model)
-    tag = text_model_tag(text_model)
-    out_dir = embedding_dir(embedding_base_dir, text_model)
-    os.makedirs(out_dir, exist_ok=True)
-
-    print(f"Generating vectors with model={model_name} (tag={tag}) -> {out_dir}")
     model = SentenceTransformer(model_name)
 
-    save_vectors_h5(
-        model,
-        os.path.join(out_dir, "tag_vectors.h5"),
-        {tid: tag_text for tag_text, tid in tag2id.items()},
-    )
+    save_vectors_h5(model, os.path.join(model_embedding_dir, "tag_vectors.h5"), {tid: tag for tag, tid in tag2id.items()})
 
-    api_id_to_desc = {api["id"]: api["details"]["description"] for api in apis}
-    save_vectors_h5(model, os.path.join(out_dir, "API_vectors.h5"), api_id_to_desc)
+    api_id_to_desc = {api["id"]: api["details"].get("description", "") for api in apis}
+    save_vectors_h5(model, os.path.join(model_embedding_dir, "API_vectors.h5"), api_id_to_desc)
 
-    mashup_id_to_desc = {m["id"]: m["description"] for m in mashups}
-    save_vectors_h5(model, os.path.join(out_dir, "vectors.h5"), mashup_id_to_desc)
+    mashup_id_to_desc = {mashup["id"]: mashup.get("description", "") for mashup in mashups}
+    save_vectors_h5(model, os.path.join(model_embedding_dir, "vectors.h5"), mashup_id_to_desc)
 
-
-def generate_folds(mashups, api_id_to_tags, mashup_id_to_tags, tag2id):
-    n_mashups = len(mashups)
-    train_valid_boundary = round(n_mashups * 0.9)
-    cv_mashups = mashups[:train_valid_boundary]
-
+    n_total = len(mashups)
+    split_idx = round(n_total * 0.9)
+    cv_mashups = mashups[:split_idx]
     folds = 10
     fold_size = ceil(len(cv_mashups) / folds)
 
@@ -114,7 +108,7 @@ def generate_folds(mashups, api_id_to_tags, mashup_id_to_tags, tag2id):
                 f.write(" ".join(line) + "\n")
 
         with open(os.path.join(fold_dir, "VA.csv"), "w", encoding="utf-8") as f:
-            for mashup in mashups[end:]:
+            for mashup in mashups[split_idx:]:
                 line = [str(mashup["id"])] + [str(api_id) for api_id in mashup.get("api_info", [])]
                 f.write(" ".join(line) + "\n")
 
@@ -128,25 +122,6 @@ def generate_folds(mashups, api_id_to_tags, mashup_id_to_tags, tag2id):
                 tags = mashup_id_to_tags.get(mashup["id"], [])
                 tag_ids = [str(tag2id[t]) for t in tags if t in tag2id]
                 f.write(f"{mashup['id']} " + " ".join(tag_ids) + "\n")
-
-
-def resolve_models_to_generate(text_model):
-    if str(text_model).strip().lower() == "all":
-        return ["bge-base", "e5-base", "gte-base", "bge-large", "e5-large", "gte-large"]
-    return [text_model]
-
-
-def main():
-    args = parse_args()
-
-    mashups, apis = load_source_data()
-    api_id_to_tags, mashup_id_to_tags, tag2id = build_tag_maps(mashups, apis)
-
-    for model_name in resolve_models_to_generate(args.text_model):
-        generate_embeddings(mashups, apis, tag2id, model_name, args.embedding_base_dir)
-
-    # Interaction/tag split files are model-agnostic and generated once.
-    generate_folds(mashups, api_id_to_tags, mashup_id_to_tags, tag2id)
 
 
 if __name__ == "__main__":

@@ -35,12 +35,10 @@ def parse_args():
     parser.add_argument('--embed_size', type=int, default=768,
                         help='Embedding size.')
     parser.add_argument('--text_model', nargs='?', default='mpnet',
-                        help='Text embedding model alias or HF name (e.g., mpnet, bge-base, e5-base, gte-base).')
+                        help='Text embedding model alias or HF name (e.g., mpnet, bge-base, bge-large, e5-base, e5-large, gte-base, gte-large).')
     parser.add_argument('--embedding_base_dir', nargs='?', default='data',
                         help='Base directory for storing/loading text embedding h5 files.')
-    parser.add_argument('--log_dir', nargs='?', default='logs',
-                        help='Directory for per-run log files.')
-    parser.add_argument('--layer_num', type=int, default=3, # 1 to 6
+    parser.add_argument('--layer_num', type=int, default=3,
                         help='Output sizes of every layer')
     parser.add_argument('--batch_size', type=int, default=512,
                         help='Batch size.')
@@ -53,28 +51,6 @@ def parse_args():
     parser.add_argument('--adj_type', nargs='?', default='norm_adj',
                         help='Specify the type of the adjacency (laplacian) matrix from {plain, norm, mean}.')
     parser.add_argument('--alg_type', nargs='?', default='hcf')
-    parser.add_argument('--use_hard_negative_sampling', type=int, default=1,
-                        help='Enable hard negative sampling during graph model training (0/1).')
-    parser.add_argument('--hard_negative_ratio', type=float, default=0.5,
-                        help='Fraction of batch negatives replaced by hard negatives.')
-    parser.add_argument('--hard_negative_candidates', type=int, default=200,
-                        help='Number of sampled candidate negatives per user for hard-negative mining.')
-    parser.add_argument('--val_interval', type=int, default=10,
-                        help='Evaluate validation metric every N epochs.')
-    parser.add_argument('--early_stop_metric', nargs='?', default='recall5',
-                        help='Metric for model selection: recall5 or loss.')
-    parser.add_argument('--text_align_weight', type=float, default=1.0,
-                        help='Weight for MSE alignment loss in text encoder training.')
-    parser.add_argument('--text_rank_weight', type=float, default=0.2,
-                        help='Weight for ranking (BPR) loss in text encoder training.')
-    parser.add_argument('--hard_negative_start_epoch', type=int, default=30,
-                        help='Enable hard negative sampling only after this epoch.')
-    parser.add_argument('--text_rank_start_epoch', type=int, default=20,
-                        help='Start epoch for enabling text ranking loss.')
-    parser.add_argument('--text_rank_warmup_epochs', type=int, default=40,
-                        help='Warmup epochs to ramp text ranking loss weight to target.')
-    parser.add_argument('--early_stop_start_epoch', type=int, default=80,
-                        help='Do not trigger early stopping before this epoch.')
     parser.add_argument('--gpu_id', type=int, default=0,
                         help='0 for NAIS_prod, 1 for NAIS_concat')
     parser.add_argument('--mess_dropout', nargs='?', default='[0.1,0.1,0.1]',
