@@ -1,0 +1,5 @@
+combo=bge1_temporal0_diffusion0
+status=ok
+text_model=bge-large
+notes=none
+python_bin=/home/abhinav24/Desktop/cvh-rec/CVH-REC/CHV-REC/../../.venv/bin/python

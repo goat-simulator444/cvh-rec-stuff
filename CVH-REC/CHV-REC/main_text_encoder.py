@@ -23,6 +23,7 @@ from utility.text_model_utils import (
     resolve_embedding_file,
     text_model_tag,
 )
+from utility.load_data import TemporalDataset
 args = parse_args()
 warnings.filterwarnings("ignore")
 
@@ -84,7 +85,9 @@ def jaccard_similarity(matrix):
     intersection = np.dot(matrix, matrix.T)
     square_sum = np.diag(intersection)  # 获取对角线上的元素
     union = square_sum[:, None] + square_sum - intersection
-    return np.divide(intersection, union)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        similarity = np.divide(intersection, union)
+    return np.nan_to_num(similarity, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 class Model_Wrapper(object):
@@ -102,6 +105,8 @@ class Model_Wrapper(object):
         self.record_alphas = False
         self.device = resolve_runtime_device()
         self.lr = args.lr
+        self.use_bge = args.use_bge == 1
+        self.use_temporal = args.use_temporal == 1
         self.emb_dim = resolve_embed_size(args.embed_size, args.text_model)
         if self.emb_dim != args.embed_size:
             print(f"Adjusted embed_size from {args.embed_size} to {self.emb_dim} for text model {args.text_model}")
@@ -171,14 +176,36 @@ class Model_Wrapper(object):
 
         self.optimizer = optim.Adam(self.text_encoder.parameters(), lr=self.lr)
 
+        self.active_modules = {
+            'bge': self.use_bge,
+            'temporal': self.use_temporal and args.temporal_hypergraph == 1,
+            'diffusion': False,
+        }
+        print(
+            f"[ModuleStatus] active={self.active_modules}, text_model={args.text_model}, "
+            f"embedding_dir={self.embedding_dir}"
+        )
+
+        dataset_dir = args.data_path + args.dataset
+        time_sliced_call_graphs = self._load_temporal_call_graphs(dataset_dir)
+
 
         (self.norm_mashup_call_1, self.norm_mashup_call_2, self.norm_api_call_1, self.norm_api_call_2,
-         self.norm_mashup_tag_1, self.norm_mashup_tag_2, self.norm_api_tag_1, self.norm_api_tag_2) = self.build_hyper_edge(
-            args.data_path + args.dataset + '/TE.csv',args.data_path + args.dataset +'/mashup_tags.csv',args.data_path + args.dataset +'/api_tags.csv')
+         self.norm_mashup_tag_1, self.norm_mashup_tag_2, self.norm_api_tag_1, self.norm_api_tag_2) = self.build_temporal_hypergraph(
+            dataset_dir + '/TE.csv',
+            dataset_dir + '/mashup_tags.csv',
+            dataset_dir + '/api_tags.csv',
+            time_sliced_data=time_sliced_call_graphs,
+        )
         print(f"norm_mashup_call_1 shape: {self.norm_mashup_call_1.shape}, norm_mashup_call_2 shape: {self.norm_mashup_call_2.shape}")
         self.global_1, self.global_2 = self.build_global_hyperedge(
-            args.data_path + args.dataset + '/TE.csv', args.data_path + args.dataset + '/mashup_tags.csv',
-            args.data_path + args.dataset + '/api_tags.csv', self.n_mashup, self.n_api, self.n_tag)
+            dataset_dir + '/TE.csv',
+            dataset_dir + '/mashup_tags.csv',
+            dataset_dir + '/api_tags.csv',
+            self.n_mashup,
+            self.n_api,
+            self.n_tag,
+        )
 
         self.mashup_tag_labels = self.load_tag_labels(
             args.data_path + args.dataset + '/mashup_tags.csv',
@@ -255,80 +282,294 @@ class Model_Wrapper(object):
         embeddings = np.stack(embeddings)  # shape = (n_users, 768)
         return torch.tensor(embeddings, dtype=torch.float32)
 
-    def build_hyper_edge(self, mashup_api_call_file, mashup_tag_call_file, api_tag_call_file):
-        def read_and_fill_matrix(filename, shape, transpose=False):
-            matrix = np.zeros(shape)
-            with open(filename) as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    parts = [item for item in line.split(" ") if item != '']
+    def _read_relation_matrix(self, filename, shape, transpose=False):
+        matrix = np.zeros(shape, dtype=np.float32)
+        with open(filename) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+
+                parts = [item for item in line.split(" ") if item != '']
+                if not parts:
+                    continue
+
+                try:
                     main_id = int(parts[0])
-                    related_ids = list(map(int, parts[1:]))
-                    if transpose:
-                        matrix[related_ids, main_id] = 1
-                    else:
-                        matrix[main_id, related_ids] = 1
-            return matrix
+                except ValueError:
+                    continue
 
-        def build_and_normalize_hyperedge(interaction_matrix, similarity_threshold, node_count, edge_prefix):
-            jaccard_sim = jaccard_similarity(interaction_matrix)
-            indices = np.where(jaccard_sim >= similarity_threshold)
-            values = jaccard_sim[indices]
-            print(f"Number of hyperedges for {edge_prefix}: {len(values)}")
+                if transpose:
+                    if not (0 <= main_id < shape[1]):
+                        continue
+                else:
+                    if not (0 <= main_id < shape[0]):
+                        continue
 
-            hyperedge = sp.coo_matrix((values, indices), (node_count, node_count))
-            hyperedge_transpose = hyperedge.T
+                related_ids = []
+                related_limit = shape[0] if transpose else shape[1]
+                for token in parts[1:]:
+                    try:
+                        rid = int(token)
+                    except ValueError:
+                        continue
+                    if 0 <= rid < related_limit:
+                        related_ids.append(rid)
 
-            Dv, De = self.get_D_inv(hyperedge_transpose)
+                if not related_ids:
+                    continue
 
-            Dv_torch = self.sparse_mx_to_torch_sparse_tensor(Dv)
-            De_torch = self.sparse_mx_to_torch_sparse_tensor(De)
-            hyperedge_torch = self.sparse_mx_to_torch_sparse_tensor(hyperedge_transpose)
-            hyperedge_transpose_torch = self.sparse_mx_to_torch_sparse_tensor(hyperedge)
+                if transpose:
+                    matrix[related_ids, main_id] = 1.0
+                else:
+                    matrix[main_id, related_ids] = 1.0
 
-            temp = sparse.mm(Dv_torch, hyperedge_torch)
-            normalized_1 = sparse.mm(temp, De_torch)
-            normalized_2 = hyperedge_transpose_torch
+        return matrix
 
+    def _load_temporal_call_graphs(self, dataset_dir):
+        if not self.use_temporal:
+            self.temporal_sub_hypergraphs = []
+            if args.temporal_hypergraph == 1:
+                print('[TemporalHypergraph] Skipped because --use_temporal=0.')
+            return []
+
+        if args.temporal_hypergraph != 1:
+            self.temporal_sub_hypergraphs = []
+            return []
+
+        try:
+            temporal_dataset = TemporalDataset(
+                path=dataset_dir,
+                batch_size=self.batch_size,
+                interaction_file=args.temporal_interaction_file,
+                timestamp_fallback=args.temporal_timestamp_fallback,
+            )
+            time_slices = temporal_dataset.get_time_slices(args.temporal_window_size)
+        except Exception as e:
+            print(f"[TemporalHypergraph][WARN] Temporal graph construction disabled due to error: {e}")
+            self.temporal_sub_hypergraphs = []
+            return []
+
+        if not time_slices:
+            self.temporal_sub_hypergraphs = []
+            return []
+
+        active_users = set()
+        active_items = set()
+
+        for idx, graph in enumerate(time_slices):
+            if graph.shape != (self.n_mashup, self.n_api):
+                raise AssertionError(
+                    f"Time slice {idx} shape mismatch: {graph.shape} != {(self.n_mashup, self.n_api)}"
+                )
+            if graph.data.size > 0 and not np.isfinite(graph.data).all():
+                raise AssertionError(f"Non-finite values found in temporal slice {idx}")
+
+            rows, cols = graph.nonzero()
+            active_users.update(rows.tolist())
+            active_items.update(cols.tolist())
+
+        missing_users = self.n_mashup - len(active_users)
+        missing_items = self.n_api - len(active_items)
+        if missing_users > 0 or missing_items > 0:
+            print(
+                f"[TemporalHypergraph][WARN] Missing active nodes across all time slices: "
+                f"users={missing_users}, apis={missing_items}"
+            )
+
+        print(
+            f"[TemporalHypergraph] Loaded {len(time_slices)} time slices "
+            f"from {temporal_dataset.interaction_file} with window_size={args.temporal_window_size}"
+        )
+        return time_slices
+
+    def _merge_time_sliced_graphs(self, time_sliced_data):
+        merged = sp.csr_matrix((self.n_mashup, self.n_api), dtype=np.float32)
+        for graph in time_sliced_data:
+            merged = merged + graph
+        if merged.nnz > 0:
+            merged.data = np.ones_like(merged.data, dtype=np.float32)
+        merged_dense = merged.toarray().astype(np.float32, copy=False)
+        assert merged_dense.shape == (self.n_mashup, self.n_api), "Merged call matrix shape mismatch"
+        assert np.isfinite(merged_dense).all(), "Merged call matrix contains NaN/Inf"
+        return merged_dense
+
+    def _assert_sparse_tensor_valid(self, tensor, tensor_name):
+        values = tensor.coalesce().values()
+        if values.numel() == 0:
+            return
+        if torch.isnan(values).any() or torch.isinf(values).any():
+            raise AssertionError(f"{tensor_name} contains NaN/Inf values")
+
+    def _build_and_normalize_hyperedge(self, interaction_matrix, similarity_threshold, node_count, edge_prefix,
+                                       store_attr):
+        assert interaction_matrix.shape[0] == node_count, (
+            f"Interaction matrix row count mismatch for {edge_prefix}: "
+            f"{interaction_matrix.shape[0]} != {node_count}"
+        )
+        if not np.isfinite(interaction_matrix).all():
+            raise AssertionError(f"{edge_prefix} interaction matrix contains NaN/Inf")
+
+        jaccard_sim = jaccard_similarity(interaction_matrix)
+        if not np.isfinite(jaccard_sim).all():
+            raise AssertionError(f"{edge_prefix} jaccard similarity contains NaN/Inf")
+
+        indices = np.where(jaccard_sim >= similarity_threshold)
+        values = jaccard_sim[indices].astype(np.float32, copy=False)
+
+        if values.size > 0 and not np.isfinite(values).all():
+            raise AssertionError(f"{edge_prefix} hyperedge values contain NaN/Inf")
+
+        hyperedge = sp.coo_matrix((values, indices), shape=(node_count, node_count), dtype=np.float32)
+        hyperedge_transpose = hyperedge.T.tocoo()
+
+        Dv, De = self.get_D_inv(hyperedge_transpose)
+
+        Dv_torch = self.sparse_mx_to_torch_sparse_tensor(Dv)
+        De_torch = self.sparse_mx_to_torch_sparse_tensor(De)
+        hyperedge_torch = self.sparse_mx_to_torch_sparse_tensor(hyperedge_transpose)
+        hyperedge_transpose_torch = self.sparse_mx_to_torch_sparse_tensor(hyperedge)
+
+        temp = sparse.mm(Dv_torch, hyperedge_torch)
+        normalized_1 = sparse.mm(temp, De_torch)
+        normalized_2 = hyperedge_transpose_torch
+
+        assert normalized_1.shape[0] == node_count and normalized_1.shape[1] == node_count, (
+            f"{edge_prefix} normalized_1 shape mismatch: {normalized_1.shape}"
+        )
+        assert normalized_2.shape[0] == node_count and normalized_2.shape[1] == node_count, (
+            f"{edge_prefix} normalized_2 shape mismatch: {normalized_2.shape}"
+        )
+
+        self._assert_sparse_tensor_valid(normalized_1, f"{edge_prefix}.normalized_1")
+        self._assert_sparse_tensor_valid(normalized_2, f"{edge_prefix}.normalized_2")
+
+        if store_attr:
             setattr(self, f'H{edge_prefix}Edge', hyperedge_torch)
             setattr(self, f'H{edge_prefix}Edge_T', hyperedge_transpose_torch)
             setattr(self, f'norm_{edge_prefix}1', normalized_1)
             setattr(self, f'norm_{edge_prefix}2', normalized_2)
 
-            return normalized_1, normalized_2
+        return normalized_1, normalized_2
 
-        # mashup调用API交互矩阵
-        mashup_api_call_matrix = read_and_fill_matrix(mashup_api_call_file, (self.n_mashup, self.n_api), transpose=False)
-        # API调用mashup矩阵（转置）
-        api_mashup_matrix = read_and_fill_matrix(mashup_api_call_file, (self.n_api, self.n_mashup), transpose=True)
+    def _build_hypergraph_bundle(self, mashup_api_call_matrix, mashup_tag_call_matrix, api_tag_call_matrix,
+                                 edge_suffix="", store_attr=True):
+        api_mashup_matrix = mashup_api_call_matrix.T
 
-        # mashup调用tag矩阵（mashup视角）
-        mashup_tag_call_matrix = read_and_fill_matrix(mashup_tag_call_file, (self.n_mashup, self.n_tag), transpose=False)
-
-
-        # API调用tag矩阵（API视角）
-        api_tag_call_matrix = read_and_fill_matrix(api_tag_call_file, (self.n_api, self.n_tag), transpose=False)
-
-        # 构造mashup超边
-        norm_mashup_call_1, norm_mashup_call_2 = build_and_normalize_hyperedge(mashup_api_call_matrix, alpha1, self.n_mashup,
-                                                                               'mashup')
-        # 构造api超边
-        norm_api_call_1, norm_api_call_2 = build_and_normalize_hyperedge(api_mashup_matrix, alpha2, self.n_api, 'api')
-
-        # 构造mashup视角的超边，mashup间调用tag相似度超边
-        norm_mashup_tag_1, norm_mashup_tag_2 = build_and_normalize_hyperedge(mashup_tag_call_matrix, alpha3,
-                                                                                     self.n_mashup, 'mashupTagSim')
-        # 构造api视角的超边，api间调用tag相似度超边
-        norm_api_tag_1, norm_api_tag_2 = build_and_normalize_hyperedge(api_tag_call_matrix, alpha4, self.n_api,
-                                                                               'apiTagSim')
+        norm_mashup_call_1, norm_mashup_call_2 = self._build_and_normalize_hyperedge(
+            mashup_api_call_matrix,
+            alpha1,
+            self.n_mashup,
+            f'mashup{edge_suffix}',
+            store_attr=store_attr,
+        )
+        norm_api_call_1, norm_api_call_2 = self._build_and_normalize_hyperedge(
+            api_mashup_matrix,
+            alpha2,
+            self.n_api,
+            f'api{edge_suffix}',
+            store_attr=store_attr,
+        )
+        norm_mashup_tag_1, norm_mashup_tag_2 = self._build_and_normalize_hyperedge(
+            mashup_tag_call_matrix,
+            alpha3,
+            self.n_mashup,
+            f'mashupTagSim{edge_suffix}',
+            store_attr=store_attr,
+        )
+        norm_api_tag_1, norm_api_tag_2 = self._build_and_normalize_hyperedge(
+            api_tag_call_matrix,
+            alpha4,
+            self.n_api,
+            f'apiTagSim{edge_suffix}',
+            store_attr=store_attr,
+        )
 
         return (
-            norm_mashup_call_1, norm_mashup_call_2,
-            norm_api_call_1, norm_api_call_2,
-            norm_mashup_tag_1, norm_mashup_tag_2,
-            norm_api_tag_1, norm_api_tag_2
+            norm_mashup_call_1,
+            norm_mashup_call_2,
+            norm_api_call_1,
+            norm_api_call_2,
+            norm_mashup_tag_1,
+            norm_mashup_tag_2,
+            norm_api_tag_1,
+            norm_api_tag_2,
+        )
+
+    def build_temporal_hypergraph(self, mashup_api_call_file, mashup_tag_call_file, api_tag_call_file,
+                                  time_sliced_data=None):
+        mashup_tag_call_matrix = self._read_relation_matrix(
+            mashup_tag_call_file,
+            (self.n_mashup, self.n_tag),
+            transpose=False,
+        )
+        api_tag_call_matrix = self._read_relation_matrix(
+            api_tag_call_file,
+            (self.n_api, self.n_tag),
+            transpose=False,
+        )
+
+        if time_sliced_data:
+            mashup_api_call_matrix = self._merge_time_sliced_graphs(time_sliced_data)
+        else:
+            mashup_api_call_matrix = self._read_relation_matrix(
+                mashup_api_call_file,
+                (self.n_mashup, self.n_api),
+                transpose=False,
+            )
+
+        main_hypergraph = self._build_hypergraph_bundle(
+            mashup_api_call_matrix,
+            mashup_tag_call_matrix,
+            api_tag_call_matrix,
+            edge_suffix="",
+            store_attr=True,
+        )
+
+        self.temporal_sub_hypergraphs = []
+        if time_sliced_data:
+            for time_step, graph in enumerate(time_sliced_data):
+                call_matrix = graph.toarray().astype(np.float32, copy=False)
+                sub_hypergraph = self._build_hypergraph_bundle(
+                    call_matrix,
+                    mashup_tag_call_matrix,
+                    api_tag_call_matrix,
+                    edge_suffix=f'_t{time_step}',
+                    store_attr=False,
+                )
+                self.temporal_sub_hypergraphs.append({
+                    'time_step': time_step,
+                    'norm_mashup_call_1': sub_hypergraph[0],
+                    'norm_mashup_call_2': sub_hypergraph[1],
+                    'norm_api_call_1': sub_hypergraph[2],
+                    'norm_api_call_2': sub_hypergraph[3],
+                    'norm_mashup_tag_1': sub_hypergraph[4],
+                    'norm_mashup_tag_2': sub_hypergraph[5],
+                    'norm_api_tag_1': sub_hypergraph[6],
+                    'norm_api_tag_2': sub_hypergraph[7],
+                })
+
+            print(f"[TemporalHypergraph] Built {len(self.temporal_sub_hypergraphs)} sub-hypergraphs.")
+
+        self.main_hypergraph = {
+            'norm_mashup_call_1': main_hypergraph[0],
+            'norm_mashup_call_2': main_hypergraph[1],
+            'norm_api_call_1': main_hypergraph[2],
+            'norm_api_call_2': main_hypergraph[3],
+            'norm_mashup_tag_1': main_hypergraph[4],
+            'norm_mashup_tag_2': main_hypergraph[5],
+            'norm_api_tag_1': main_hypergraph[6],
+            'norm_api_tag_2': main_hypergraph[7],
+        }
+
+        return main_hypergraph
+
+    def build_hyper_edge(self, mashup_api_call_file, mashup_tag_call_file, api_tag_call_file):
+        return self.build_temporal_hypergraph(
+            mashup_api_call_file,
+            mashup_tag_call_file,
+            api_tag_call_file,
+            time_sliced_data=None,
         )
 
 
@@ -627,9 +868,12 @@ class Model_Wrapper(object):
             # print the test evaluation metrics each 10 epochs; pos:neg = 1:10.
             if (epoch + 1) % 10 != 0:
                 if args.verbose > 0 and epoch % args.verbose == 0:
+                    epoch_time = max(1e-6, time() - t1)
+                    batches_per_sec = valid_batches / epoch_time
                     perf_str = (
-                        f"Epoch {epoch} [{time() - t1:.1f}s]: "
-                        f"loss={loss:.5f}"
+                        f"Epoch {epoch} [{epoch_time:.1f}s]: "
+                        f"loss={loss:.5f}, avg_loss={avg_loss:.5f}, "
+                        f"sample_t={sample_time:.2f}s, batch_per_s={batches_per_sec:.2f}"
                     )
                     print(perf_str)
         if args.save_flag == 1:

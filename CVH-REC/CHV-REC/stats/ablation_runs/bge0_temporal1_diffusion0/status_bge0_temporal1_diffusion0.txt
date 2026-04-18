@@ -1,0 +1,5 @@
+combo=bge0_temporal1_diffusion0
+status=failed
+text_model=mpnet
+notes=main_failed:fold1
+python_bin=/home/abhinav24/Desktop/cvh-rec/CVH-REC/CHV-REC/../../.venv/bin/python

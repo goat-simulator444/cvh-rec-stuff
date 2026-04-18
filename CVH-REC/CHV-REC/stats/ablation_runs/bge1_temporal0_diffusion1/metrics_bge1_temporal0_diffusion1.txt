@@ -1,0 +1,14 @@
+File ../output/ablation_runs/bge1_temporal0_diffusion1/CVH-REC_bge_large_fold2.json does not exist. Please run the corresponding command to obtain the recommendation results.
+File ../output/ablation_runs/bge1_temporal0_diffusion1/CVH-REC_bge_large_fold3.json does not exist. Please run the corresponding command to obtain the recommendation results.
+File ../output/ablation_runs/bge1_temporal0_diffusion1/CVH-REC_bge_large_fold4.json does not exist. Please run the corresponding command to obtain the recommendation results.
+File ../output/ablation_runs/bge1_temporal0_diffusion1/CVH-REC_bge_large_fold5.json does not exist. Please run the corresponding command to obtain the recommendation results.
+File ../output/ablation_runs/bge1_temporal0_diffusion1/CVH-REC_bge_large_fold6.json does not exist. Please run the corresponding command to obtain the recommendation results.
+File ../output/ablation_runs/bge1_temporal0_diffusion1/CVH-REC_bge_large_fold7.json does not exist. Please run the corresponding command to obtain the recommendation results.
+File ../output/ablation_runs/bge1_temporal0_diffusion1/CVH-REC_bge_large_fold8.json does not exist. Please run the corresponding command to obtain the recommendation results.
+File ../output/ablation_runs/bge1_temporal0_diffusion1/CVH-REC_bge_large_fold9.json does not exist. Please run the corresponding command to obtain the recommendation results.
+File ../output/ablation_runs/bge1_temporal0_diffusion1/CVH-REC_bge_large_fold10.json does not exist. Please run the corresponding command to obtain the recommendation results.
+N values  : 3                5                10               20              
+Precision :  0.3566±0.0000  0.2353±0.0000  0.1324±0.0000  0.0723±0.0000
+Recall    :  0.6631±0.0000  0.7058±0.0000  0.7619±0.0000  0.8002±0.0000
+MAP       :  0.7801±0.0000  0.7748±0.0000  0.7610±0.0000  0.7430±0.0000
+NDCG      :  0.6920±0.0000  0.6990±0.0000  0.7176±0.0000  0.7303±0.0000

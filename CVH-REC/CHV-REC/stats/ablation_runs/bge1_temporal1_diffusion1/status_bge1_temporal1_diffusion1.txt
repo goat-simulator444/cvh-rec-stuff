@@ -1,0 +1,9 @@
+combo=bge1_temporal1_diffusion1
+status=ok
+dataset=fold1
+method=CVH-REC
+text_model=bge-large
+python_bin=/home/abhinav24/Desktop/cvh-rec/CVH-REC/CHV-REC/../../.venv/bin/python
+output_dir=../output/ablation_runs/bge1_temporal1_diffusion1
+logs_dir=logs/ablation_runs/bge1_temporal1_diffusion1
+stats_file=stats/ablation_runs/bge1_temporal1_diffusion1/metrics_bge1_temporal1_diffusion1.txt
