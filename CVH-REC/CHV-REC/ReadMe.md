@@ -45,7 +45,7 @@ To generate the dataset, start Python in **command line** mode and run:
 
     python generate_dataset.py
 
-This script uses the original files `Original Dataset/mashups.json` and `Original Dataset/apis.json` as input and performs the following operations:
+This script uses the original files `Original Dataset/mashup_shuffled.json` and `Original Dataset/apis.json` as input and performs the following operations:
 
 *   Generates **training set, testing set, and validation set**  under the `dataset` folder.
 
@@ -62,6 +62,50 @@ Each `dataset/foldX/` directory includes:
     VA.csv        # Validation set
     api_tags.csv  # API–tag relationships
     mashup_tags.csv # Mashup–tag relationships
+
+### 2.1.1 Build HIT-ICES timestamp map and fold-wise temporal assets
+
+If you want to attach real timestamps from the HIT-ICES corrected ProgrammableWeb dataset, run the following from the `CHV-REC` directory.
+
+Step A. Build local mashup_id -> timestamp map from HIT-ICES raw mashups:
+
+    python utility/build_hitices_timestamp_map.py \
+      --local_mashups_file "Original Dataset/mashup_shuffled.json" \
+      --output_map_file "data/timestamp_map_hitices.json" \
+      --output_report_file "data/timestamp_map_hitices_report.json" \
+      --output_unmatched_file "data/timestamp_map_hitices_unmatched.json"
+
+Step B. Regenerate fold datasets with temporal files and fold-wise timestamp maps:
+
+    python generate_dataset.py \
+      --timestamp_map_file "data/timestamp_map_hitices.json" \
+      --write_temporal_files 1 \
+      --write_foldwise_timestamp_maps 1 \
+      --timestamp_fallback line_order
+
+If you only want to rebuild dataset split/temporal files and do not want to recompute text embeddings, add:
+
+    --skip_embedding_generation 1
+
+The generation step writes these temporal files per fold:
+
+    TE_temporal.csv
+    RS_temporal.csv
+    VA_temporal.csv
+
+It also writes fold-wise timestamp map artifacts under:
+
+    dataset/foldX/timestamp_maps/
+
+including:
+
+    train.json
+    test.json
+    val.json
+    all.json
+    coverage_report.json
+
+With these files, each fold remains independently runnable because all temporal interactions and fold-scoped timestamp mapping metadata are stored inside the fold directory.
 
 ### 2.2 Reproducing Experiments in the Paper
 

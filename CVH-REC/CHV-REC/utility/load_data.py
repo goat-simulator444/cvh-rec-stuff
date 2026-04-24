@@ -497,7 +497,20 @@ class TemporalDataset(Data):
             print(f'[TemporalDataset][WARN] Empty time slices detected/skipped: {empty_slices}')
 
         print(f'[TemporalDataset] Number of slices: {len(graphs)}')
-        print(f'[TemporalDataset] Edges per slice: {edges_per_slice}')
+        if edges_per_slice:
+            edge_min = min(edges_per_slice)
+            edge_max = max(edges_per_slice)
+            edge_mean = float(np.mean(edges_per_slice))
+            preview_count = min(10, len(edges_per_slice))
+            head_preview = edges_per_slice[:preview_count]
+            tail_preview = edges_per_slice[-preview_count:]
+            print(
+                '[TemporalDataset] Edges per slice stats: '
+                f'min={edge_min}, max={edge_max}, mean={edge_mean:.2f}, '
+                f'first{preview_count}={head_preview}, last{preview_count}={tail_preview}'
+            )
+        else:
+            print('[TemporalDataset] Edges per slice stats: []')
 
         return graphs
 

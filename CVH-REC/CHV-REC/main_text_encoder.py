@@ -107,6 +107,7 @@ class Model_Wrapper(object):
         self.lr = args.lr
         self.use_bge = args.use_bge == 1
         self.use_temporal = args.use_temporal == 1
+        self.runtime_temporal_max_steps = max(0, int(args.temporal_max_steps))
         self.emb_dim = resolve_embed_size(args.embed_size, args.text_model)
         if self.emb_dim != args.embed_size:
             print(f"Adjusted embed_size from {args.embed_size} to {self.emb_dim} for text model {args.text_model}")
@@ -394,6 +395,42 @@ class Model_Wrapper(object):
         assert np.isfinite(merged_dense).all(), "Merged call matrix contains NaN/Inf"
         return merged_dense
 
+    def _select_temporal_subgraph_slices(self, time_sliced_data):
+        if not time_sliced_data:
+            return []
+
+        stride = max(1, int(args.temporal_stride))
+        selected_indices = list(range(0, len(time_sliced_data), stride))
+
+        min_edges = max(0, int(args.temporal_min_edges_per_slice))
+        if min_edges > 0:
+            filtered_indices = [
+                idx for idx in selected_indices
+                if int(time_sliced_data[idx].nnz) >= min_edges
+            ]
+            if filtered_indices:
+                selected_indices = filtered_indices
+            else:
+                print(
+                    f"[TemporalHypergraph][WARN] No temporal slices meet min_edges_per_slice={min_edges}; "
+                    "keeping stride-selected slices."
+                )
+
+        max_steps = int(self.runtime_temporal_max_steps)
+        if max_steps > 0 and len(selected_indices) > max_steps:
+            pool_multiplier = max(1, int(args.temporal_recent_pool_multiplier))
+            pool_size = max_steps * pool_multiplier
+            recent_pool = selected_indices[-pool_size:]
+
+            ranked_pool = sorted(
+                recent_pool,
+                key=lambda idx: (int(time_sliced_data[idx].nnz), idx),
+                reverse=True,
+            )
+            selected_indices = sorted(ranked_pool[:max_steps])
+
+        return [(idx, time_sliced_data[idx]) for idx in selected_indices]
+
     def _assert_sparse_tensor_valid(self, tensor, tensor_name):
         values = tensor.coalesce().values()
         if values.numel() == 0:
@@ -528,7 +565,8 @@ class Model_Wrapper(object):
 
         self.temporal_sub_hypergraphs = []
         if time_sliced_data:
-            for time_step, graph in enumerate(time_sliced_data):
+            selected_slices = self._select_temporal_subgraph_slices(time_sliced_data)
+            for time_step, graph in selected_slices:
                 call_matrix = graph.toarray().astype(np.float32, copy=False)
                 sub_hypergraph = self._build_hypergraph_bundle(
                     call_matrix,
@@ -549,7 +587,11 @@ class Model_Wrapper(object):
                     'norm_api_tag_2': sub_hypergraph[7],
                 })
 
-            print(f"[TemporalHypergraph] Built {len(self.temporal_sub_hypergraphs)} sub-hypergraphs.")
+            print(
+                f"[TemporalHypergraph] Built {len(self.temporal_sub_hypergraphs)} sub-hypergraphs "
+                f"(selected from {len(time_sliced_data)} slices with stride={max(1, int(args.temporal_stride))}, "
+                f"runtime_max_steps={self.runtime_temporal_max_steps})."
+            )
 
         self.main_hypergraph = {
             'norm_mashup_call_1': main_hypergraph[0],
@@ -709,10 +751,28 @@ class Model_Wrapper(object):
         torch.save(self.text_encoder.state_dict(), self.DNN_weights_save_path)
 
     def load_model(self):
-        self.model.load_state_dict(torch.load(self.weights_save_path))
+        state = torch.load(self.weights_save_path, map_location=self.device)
+
+        # main.py checkpoints are saved as a payload dict with model/temporal/diffusion blocks.
+        # Keep compatibility with both wrapped payloads and plain model.state_dict checkpoints.
+        if isinstance(state, dict) and 'model' in state and isinstance(state['model'], dict):
+            model_state = state['model']
+        else:
+            model_state = state
+
+        # Handle DataParallel checkpoints saved with a "module." prefix.
+        if isinstance(model_state, dict) and len(model_state) > 0:
+            first_key = next(iter(model_state.keys()))
+            if isinstance(first_key, str) and first_key.startswith('module.'):
+                model_state = {k[len('module.'):]: v for k, v in model_state.items()}
+
+        self.model.load_state_dict(model_state)
 
     def load_DNN_model(self):
-        self.text_encoder.load_state_dict(torch.load(self.DNN_weights_save_path))
+        dnn_state = torch.load(self.DNN_weights_save_path, map_location=self.device)
+        if isinstance(dnn_state, dict) and 'text_encoder' in dnn_state and isinstance(dnn_state['text_encoder'], dict):
+            dnn_state = dnn_state['text_encoder']
+        self.text_encoder.load_state_dict(dnn_state)
 
     def train(self):
         training_time_list = []

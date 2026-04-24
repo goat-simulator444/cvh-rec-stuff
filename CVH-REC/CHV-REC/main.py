@@ -142,6 +142,10 @@ class Model_Wrapper(object):
         self.temporal_graph_sequence = []
         self.temporal_call_edge_counts = []
         self.last_temporal_step_count = 0
+        self.runtime_temporal_max_steps = max(0, int(args.temporal_max_steps))
+        self.temporal_oom_backoff_count = 0
+        self.temporal_time_slices = []
+        self.temporal_sub_hypergraphs = []
 
         self.use_diffusion = args.use_diffusion == 1
         if args.use_diffusion == 1 and args.edge_diffusion == 0:
@@ -255,7 +259,8 @@ class Model_Wrapper(object):
         print(
             f"[TrainConfig] use_bge={self.use_bge}, use_temporal={self.use_temporal}, "
             f"temporal_steps={len(self.temporal_graph_sequence)}, use_diffusion={self.use_diffusion}, "
-            f"real_edges={int(self.real_edge_index.size(1))}"
+            f"real_edges={int(self.real_edge_index.size(1))}, "
+            f"runtime_temporal_max_steps={self.runtime_temporal_max_steps}"
         )
 
         self.lr_scheduler = self.set_lr_scheduler()
@@ -359,10 +364,38 @@ class Model_Wrapper(object):
             'norm_api_tag_1', 'norm_api_tag_2',
         )
 
+        # Keep cached temporal sub-graphs on CPU to avoid high peak GPU memory.
+        # Selected temporal steps are moved to runtime device lazily in
+        # _refresh_temporal_graph_sequence after stride/max-step filtering.
+        moved_to_cpu = 0
         for sub_graph in self.temporal_sub_hypergraphs:
             for key in tensor_keys:
                 if key in sub_graph and torch.is_tensor(sub_graph[key]):
-                    sub_graph[key] = sub_graph[key].to(self.device)
+                    if sub_graph[key].device.type != 'cpu':
+                        sub_graph[key] = sub_graph[key].cpu()
+                        moved_to_cpu += 1
+
+        if len(self.temporal_sub_hypergraphs) > 0:
+            print(
+                f"[TemporalHypergraph] Keeping {len(self.temporal_sub_hypergraphs)} sub-hypergraphs on CPU "
+                f"(moved_to_cpu={moved_to_cpu}) and moving selected steps lazily to {self.device}."
+            )
+
+    def _prepare_runtime_temporal_sub_graph(self, sub_graph):
+        tensor_keys = (
+            'norm_mashup_call_1', 'norm_mashup_call_2',
+            'norm_api_call_1', 'norm_api_call_2',
+            'norm_mashup_tag_1', 'norm_mashup_tag_2',
+            'norm_api_tag_1', 'norm_api_tag_2',
+        )
+
+        runtime_graph = {}
+        for key, value in sub_graph.items():
+            if key in tensor_keys and torch.is_tensor(value):
+                runtime_graph[key] = value.to(self.device)
+            else:
+                runtime_graph[key] = value
+        return runtime_graph
 
     def _refresh_temporal_graph_sequence(self):
         main_step = (
@@ -377,17 +410,45 @@ class Model_Wrapper(object):
         edge_counts = []
 
         if self.use_temporal and len(self.temporal_sub_hypergraphs) > 0:
-            stride = max(1, int(args.temporal_stride))
-            selected_sub_graphs = self.temporal_sub_hypergraphs[::stride]
+            selected_sub_graphs = list(self.temporal_sub_hypergraphs)
+            requested_steps = len(selected_sub_graphs)
+            selected_for_runtime = list(selected_sub_graphs)
+            runtime_sub_graphs = []
+            while True:
+                try:
+                    runtime_sub_graphs = [
+                        self._prepare_runtime_temporal_sub_graph(sg)
+                        for sg in selected_for_runtime
+                    ]
+                    break
+                except torch.OutOfMemoryError:
+                    runtime_sub_graphs = []
+                    if self.device.type != 'cuda' or len(selected_for_runtime) <= 1:
+                        raise
 
-            max_steps = int(args.temporal_max_steps)
-            if max_steps > 0:
-                selected_sub_graphs = selected_sub_graphs[-max_steps:]
+                    torch.cuda.empty_cache()
+                    reduced_steps = max(1, len(selected_for_runtime) // 2)
+                    if reduced_steps >= len(selected_for_runtime):
+                        reduced_steps = len(selected_for_runtime) - 1
+
+                    print(
+                        f"[TemporalHypergraph][WARN] CUDA OOM while moving temporal steps to GPU. "
+                        f"Reducing steps from {len(selected_for_runtime)} to {reduced_steps}."
+                    )
+                    selected_for_runtime = selected_for_runtime[-reduced_steps:]
+
+            if len(selected_for_runtime) != requested_steps:
+                print(
+                    f"[TemporalHypergraph] Using {len(selected_for_runtime)} temporal steps at runtime "
+                    f"(requested {requested_steps} built temporal steps)."
+                )
+
+            selected_sub_graphs = selected_for_runtime
 
             # Each temporal HGNN step needs global hypergraph tensors to satisfy HCF.forward signature.
             sequence.extend(
                 build_temporal_graph_sequence(
-                    selected_sub_graphs,
+                    runtime_sub_graphs,
                     self.global_1,
                     self.global_2,
                 )
@@ -400,6 +461,57 @@ class Model_Wrapper(object):
         self.temporal_graph_sequence = sequence
         self.temporal_call_edge_counts = edge_counts
         self.last_temporal_step_count = len(sequence)
+
+    def _reduce_temporal_memory_after_oom(self, stage):
+        recovered = False
+
+        if self.device.type == 'cuda' and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        if self.temporal_model is not None and not self.temporal_model.detach_state_between_steps:
+            self.temporal_model.detach_state_between_steps = True
+            recovered = True
+            print(
+                f"[TemporalHGNN][OOM] {stage}: enabled detach_state_between_steps=True to reduce activation memory."
+            )
+
+        if self.use_temporal and len(self.temporal_time_slices) > 0:
+            stride = max(1, int(args.temporal_stride))
+            available_steps = len(list(range(0, len(self.temporal_time_slices), stride)))
+            current_limit = self.runtime_temporal_max_steps if self.runtime_temporal_max_steps > 0 else available_steps
+
+            if current_limit > 1:
+                reduced_limit = max(1, current_limit // 2)
+                if reduced_limit < current_limit:
+                    self.runtime_temporal_max_steps = reduced_limit
+                    self._rebuild_temporal_sub_hypergraphs()
+                    self._refresh_temporal_graph_sequence()
+                    recovered = True
+                    print(
+                        f"[TemporalHGNN][OOM] {stage}: reduced runtime_temporal_max_steps "
+                        f"from {current_limit} to {reduced_limit}; current temporal_steps={self.last_temporal_step_count}."
+                    )
+
+        if recovered:
+            self.temporal_oom_backoff_count += 1
+
+        return recovered
+
+    @staticmethod
+    def _is_cuda_oom_like_error(error):
+        if isinstance(error, torch.OutOfMemoryError):
+            return True
+
+        if not isinstance(error, RuntimeError):
+            return False
+
+        message = str(error).lower()
+        oom_markers = (
+            'out of memory',
+            'cublas_status_alloc_failed',
+            'cuda malloc',
+        )
+        return any(marker in message for marker in oom_markers)
 
     def _forward_hgnn(self):
         if self.use_temporal and self.temporal_model is not None:
@@ -430,6 +542,24 @@ class Model_Wrapper(object):
             self.temporal_model.eval()
         self.edge_diffusion.eval()
 
+        real_edge_count = int(self.real_edge_index.size(1))
+        configured_max_total_edges = args.edge_gen_max_total_edges if args.edge_gen_max_total_edges > 0 else None
+        max_ratio_to_real = float(args.edge_gen_max_ratio_to_real)
+        dynamic_max_total_edges = configured_max_total_edges
+        if max_ratio_to_real > 0.0 and real_edge_count > 0:
+            ratio_cap_edges = max(1, int(real_edge_count * max_ratio_to_real))
+            if dynamic_max_total_edges is None:
+                dynamic_max_total_edges = ratio_cap_edges
+            else:
+                dynamic_max_total_edges = min(dynamic_max_total_edges, ratio_cap_edges)
+
+        if dynamic_max_total_edges is not None and dynamic_max_total_edges != configured_max_total_edges:
+            print(
+                f"[EdgeDiffusion] Applying ratio cap: max_total_edges={dynamic_max_total_edges} "
+                f"(configured={configured_max_total_edges}, real_edges={real_edge_count}, "
+                f"max_ratio_to_real={max_ratio_to_real:.3f})"
+            )
+
         with torch.no_grad():
             outputs = self._forward_hgnn()
             m_embeddings, a_embeddings = outputs[0], outputs[1]
@@ -442,13 +572,12 @@ class Model_Wrapper(object):
                 real_edge_index=self.real_edge_index,
                 max_edges_per_node=max(0, int(args.edge_gen_max_edges_per_node)),
                 topk_per_node=args.edge_gen_topk_per_node if args.edge_gen_topk_per_node > 0 else None,
-                max_total_edges=args.edge_gen_max_total_edges if args.edge_gen_max_total_edges > 0 else None,
+                max_total_edges=dynamic_max_total_edges,
                 threshold_step=max(0.0, float(args.edge_gen_threshold_step)),
                 max_threshold_tuning_steps=max(0, int(args.edge_gen_threshold_tuning_steps)),
                 chunk_size=max(256, int(args.edge_gen_chunk_size)),
             )
 
-        real_edge_count = int(self.real_edge_index.size(1))
         if generated_edge_index.numel() == 0 and self.last_augmented_edge_count == real_edge_count:
             self.last_generated_edge_count = 0
             self.edge_generation_threshold = float(gen_stats.get('effective_threshold', self.edge_generation_threshold))
@@ -609,6 +738,84 @@ class Model_Wrapper(object):
         assert np.isfinite(merged_dense).all(), "Merged call matrix contains NaN/Inf"
         return merged_dense
 
+    def _select_temporal_slice_indices(self):
+        if not self.temporal_time_slices:
+            return []
+
+        stride = max(1, int(args.temporal_stride))
+        selected_indices = list(range(0, len(self.temporal_time_slices), stride))
+
+        min_edges = max(0, int(args.temporal_min_edges_per_slice))
+        if min_edges > 0:
+            filtered_indices = [
+                idx for idx in selected_indices
+                if int(self.temporal_time_slices[idx].nnz) >= min_edges
+            ]
+            if filtered_indices:
+                selected_indices = filtered_indices
+            else:
+                print(
+                    f"[TemporalHypergraph][WARN] No temporal slices meet min_edges_per_slice={min_edges}; "
+                    "keeping stride-selected slices."
+                )
+
+        max_steps = int(self.runtime_temporal_max_steps)
+        if max_steps > 0 and len(selected_indices) > max_steps:
+            pool_multiplier = max(1, int(args.temporal_recent_pool_multiplier))
+            pool_size = max_steps * pool_multiplier
+            recent_pool = selected_indices[-pool_size:]
+
+            ranked_pool = sorted(
+                recent_pool,
+                key=lambda idx: (int(self.temporal_time_slices[idx].nnz), idx),
+                reverse=True,
+            )
+            selected_indices = sorted(ranked_pool[:max_steps])
+
+        return selected_indices
+
+    def _rebuild_temporal_sub_hypergraphs(self):
+        self.temporal_sub_hypergraphs = []
+
+        if not self.temporal_time_slices:
+            return
+
+        selected_indices = self._select_temporal_slice_indices()
+        if not selected_indices:
+            print('[TemporalHypergraph][WARN] No temporal slices selected after stride/max-step filtering.')
+            return
+
+        built_sub_hypergraphs = []
+        for time_step in selected_indices:
+            graph = self.temporal_time_slices[time_step]
+            call_matrix = graph.toarray().astype(np.float32, copy=False)
+            sub_hypergraph = self._build_hypergraph_bundle(
+                call_matrix,
+                self.cached_mashup_tag_call_matrix,
+                self.cached_api_tag_call_matrix,
+                edge_suffix=f'_t{time_step}',
+                store_attr=False,
+            )
+            built_sub_hypergraphs.append({
+                'time_step': time_step,
+                'call_edge_count': int(graph.nnz),
+                'norm_mashup_call_1': sub_hypergraph[0],
+                'norm_mashup_call_2': sub_hypergraph[1],
+                'norm_api_call_1': sub_hypergraph[2],
+                'norm_api_call_2': sub_hypergraph[3],
+                'norm_mashup_tag_1': sub_hypergraph[4],
+                'norm_mashup_tag_2': sub_hypergraph[5],
+                'norm_api_tag_1': sub_hypergraph[6],
+                'norm_api_tag_2': sub_hypergraph[7],
+            })
+
+        self.temporal_sub_hypergraphs = built_sub_hypergraphs
+        print(
+            f"[TemporalHypergraph] Built {len(self.temporal_sub_hypergraphs)} sub-hypergraphs "
+            f"(selected from {len(self.temporal_time_slices)} slices with stride={max(1, int(args.temporal_stride))}, "
+            f"runtime_max_steps={self.runtime_temporal_max_steps})."
+        )
+
     def _assert_sparse_tensor_valid(self, tensor, tensor_name):
         values = tensor.coalesce().values()
         if values.numel() == 0:
@@ -747,31 +954,10 @@ class Model_Wrapper(object):
             store_attr=True,
         )
 
+        self.temporal_time_slices = list(time_sliced_data) if time_sliced_data else []
         self.temporal_sub_hypergraphs = []
-        if time_sliced_data:
-            for time_step, graph in enumerate(time_sliced_data):
-                call_matrix = graph.toarray().astype(np.float32, copy=False)
-                sub_hypergraph = self._build_hypergraph_bundle(
-                    call_matrix,
-                    mashup_tag_call_matrix,
-                    api_tag_call_matrix,
-                    edge_suffix=f'_t{time_step}',
-                    store_attr=False,
-                )
-                self.temporal_sub_hypergraphs.append({
-                    'time_step': time_step,
-                    'call_edge_count': int(graph.nnz),
-                    'norm_mashup_call_1': sub_hypergraph[0],
-                    'norm_mashup_call_2': sub_hypergraph[1],
-                    'norm_api_call_1': sub_hypergraph[2],
-                    'norm_api_call_2': sub_hypergraph[3],
-                    'norm_mashup_tag_1': sub_hypergraph[4],
-                    'norm_mashup_tag_2': sub_hypergraph[5],
-                    'norm_api_tag_1': sub_hypergraph[6],
-                    'norm_api_tag_2': sub_hypergraph[7],
-                })
-
-            print(f"[TemporalHypergraph] Built {len(self.temporal_sub_hypergraphs)} sub-hypergraphs.")
+        if self.temporal_time_slices:
+            self._rebuild_temporal_sub_hypergraphs()
 
         self.main_hypergraph = {
             'norm_mashup_call_1': main_hypergraph[0],
@@ -1016,7 +1202,35 @@ class Model_Wrapper(object):
                     continue
 
                 forward_t1 = time()
-                outputs = self._forward_hgnn()
+                try:
+                    outputs = self._forward_hgnn()
+                except (torch.OutOfMemoryError, RuntimeError) as e:
+                    if not self._is_cuda_oom_like_error(e):
+                        raise
+
+                    bad_batch_count += 1
+                    stage = f"epoch={epoch}, batch={idx}, phase=forward"
+                    print(f"[OOM][WARN] {stage}: {e}")
+                    self.optimizer.zero_grad(set_to_none=True)
+
+                    recovered = self._reduce_temporal_memory_after_oom(stage)
+                    if not recovered:
+                        print(f"[OOM][WARN] {stage}: no additional temporal-memory fallback available; skipping batch.")
+                        if self.device.type == 'cuda' and torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        continue
+
+                    try:
+                        outputs = self._forward_hgnn()
+                    except (torch.OutOfMemoryError, RuntimeError) as e_retry:
+                        if not self._is_cuda_oom_like_error(e_retry):
+                            raise
+
+                        print(f"[OOM][WARN] {stage}: retry after temporal backoff still failed; skipping batch. {e_retry}")
+                        if self.device.type == 'cuda' and torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        self.optimizer.zero_grad(set_to_none=True)
+                        continue
                 forward_time += time() - forward_t1
 
                 if len(outputs) < 12:
@@ -1094,7 +1308,24 @@ class Model_Wrapper(object):
                     continue
 
                 backward_t1 = time()
-                batch_loss.backward()
+                try:
+                    batch_loss.backward()
+                except (torch.OutOfMemoryError, RuntimeError) as e:
+                    if not self._is_cuda_oom_like_error(e):
+                        raise
+
+                    bad_batch_count += 1
+                    stage = f"epoch={epoch}, batch={idx}, phase=backward"
+                    print(f"[OOM][WARN] {stage}: {e}")
+                    self.optimizer.zero_grad(set_to_none=True)
+                    recovered = self._reduce_temporal_memory_after_oom(stage)
+                    if recovered:
+                        print(f"[OOM][WARN] {stage}: temporal-memory backoff applied; continuing with next batch.")
+                    else:
+                        print(f"[OOM][WARN] {stage}: no additional temporal-memory fallback available; continuing with next batch.")
+                    if self.device.type == 'cuda' and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    continue
 
                 if self.temporal_model is not None:
                     grad_is_healthy, bad_name = self.temporal_model.gradient_health_check()

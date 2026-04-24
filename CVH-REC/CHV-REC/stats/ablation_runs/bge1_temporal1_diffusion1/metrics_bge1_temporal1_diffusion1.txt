@@ -7,7 +7,8 @@ File ../output/ablation_runs/bge1_temporal1_diffusion1/CVH-REC_bge_large_fold7.j
 File ../output/ablation_runs/bge1_temporal1_diffusion1/CVH-REC_bge_large_fold8.json does not exist. Please run the corresponding command to obtain the recommendation results.
 File ../output/ablation_runs/bge1_temporal1_diffusion1/CVH-REC_bge_large_fold9.json does not exist. Please run the corresponding command to obtain the recommendation results.
 File ../output/ablation_runs/bge1_temporal1_diffusion1/CVH-REC_bge_large_fold10.json does not exist. Please run the corresponding command to obtain the recommendation results.
-Precision :  0.3566±0.0000  0.2353±0.0000  0.1324±0.0000  0.0723±0.0000
-Recall    :  0.6631±0.0000  0.7058±0.0000  0.7619±0.0000  0.8002±0.0000
-MAP       :  0.7801±0.0000  0.7748±0.0000  0.7610±0.0000  0.7430±0.0000
-NDCG      :  0.6920±0.0000  0.6990±0.0000  0.7176±0.0000  0.7303±0.0000N values  : 3                5                10               20              
+N values  : 3                5                10               20              
+Precision :  0.2140±0.0000  0.1544±0.0000  0.0974±0.0000  0.0587±0.0000
+Recall    :  0.3905±0.0000  0.4609±0.0000  0.5591±0.0000  0.6567±0.0000
+MAP       :  0.4636±0.0000  0.4776±0.0000  0.4778±0.0000  0.4684±0.0000
+NDCG      :  0.3932±0.0000  0.4157±0.0000  0.4506±0.0000  0.4799±0.0000

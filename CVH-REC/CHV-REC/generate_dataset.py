@@ -6,7 +6,6 @@ from math import ceil
 
 import h5py
 import numpy as np
-from sentence_transformers import SentenceTransformer
 
 from utility.text_model_utils import embedding_dir, resolve_text_model_name, text_model_tag
 
@@ -39,6 +38,23 @@ def parse_args():
         choices=["line_order", "mashup_id"],
         default="line_order",
         help="Fallback timestamp strategy when timestamp_map_file is missing or incomplete.",
+    )
+    parser.add_argument(
+        "--write_foldwise_timestamp_maps",
+        type=int,
+        default=1,
+        help="Whether to write fold-wise timestamp map files for train/test/val splits (1=yes, 0=no).",
+    )
+    parser.add_argument(
+        "--fold_timestamp_maps_subdir",
+        default="timestamp_maps",
+        help="Subdirectory name inside each dataset/foldX directory to store fold-wise timestamp map files.",
+    )
+    parser.add_argument(
+        "--skip_embedding_generation",
+        type=int,
+        default=0,
+        help="Whether to skip embedding generation and only rebuild dataset split files (1=yes, 0=no).",
     )
     return parser.parse_args()
 
@@ -136,36 +152,143 @@ def _resolve_timestamp(mashup_id, interaction_order, timestamp_map, timestamp_fa
     raise ValueError(f"Unsupported timestamp_fallback: {timestamp_fallback}")
 
 
-def write_temporal_interactions(file_path, mashup_rows, timestamp_map, timestamp_fallback):
+def build_temporal_records(mashup_rows, timestamp_map, timestamp_fallback):
     interaction_order = 0
     edge_count = 0
     map_edges = 0
     fallback_edges = 0
+    records = []
 
-    with open(file_path, "w", encoding="utf-8") as f:
-        for mashup in mashup_rows:
-            mashup_id = int(mashup["id"])
-            for api_id in mashup.get("api_info", []):
-                timestamp, source = _resolve_timestamp(
-                    mashup_id,
-                    interaction_order,
-                    timestamp_map,
-                    timestamp_fallback,
-                )
-                f.write(f"{mashup_id} {int(api_id)} {timestamp}\n")
+    for mashup in mashup_rows:
+        mashup_id = int(mashup["id"])
+        for api_id in mashup.get("api_info", []):
+            timestamp, source = _resolve_timestamp(
+                mashup_id,
+                interaction_order,
+                timestamp_map,
+                timestamp_fallback,
+            )
+            records.append(
+                {
+                    "mashup_id": mashup_id,
+                    "api_id": int(api_id),
+                    "timestamp": float(timestamp),
+                    "source": source,
+                }
+            )
 
-                edge_count += 1
-                interaction_order += 1
-                if source == "map":
-                    map_edges += 1
-                else:
-                    fallback_edges += 1
+            edge_count += 1
+            interaction_order += 1
+            if source == "map":
+                map_edges += 1
+            else:
+                fallback_edges += 1
 
-    return {
+    stats = {
         "edges": edge_count,
         "map_edges": map_edges,
         "fallback_edges": fallback_edges,
     }
+    return records, stats
+
+
+def write_temporal_interactions(file_path, temporal_records):
+    with open(file_path, "w", encoding="utf-8") as f:
+        for record in temporal_records:
+            f.write(f"{record['mashup_id']} {record['api_id']} {record['timestamp']}\n")
+
+
+def _build_fold_timestamp_map(mashup_rows, timestamp_map):
+    fold_map = {}
+    missing = []
+
+    for mashup in mashup_rows:
+        mashup_id = int(mashup["id"])
+        if mashup_id in timestamp_map:
+            fold_map[str(mashup_id)] = float(timestamp_map[mashup_id])
+        else:
+            missing.append(mashup_id)
+
+    return fold_map, missing
+
+
+def _write_json(file_path, obj):
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, sort_keys=True)
+
+
+def _write_foldwise_timestamp_maps(
+    fold_dir,
+    timestamp_maps_subdir,
+    train_set,
+    test_set,
+    val_set,
+    timestamp_map,
+    timestamp_map_file,
+    timestamp_fallback,
+    temporal_stats,
+):
+    maps_dir = os.path.join(fold_dir, timestamp_maps_subdir)
+    os.makedirs(maps_dir, exist_ok=True)
+
+    train_map, train_missing = _build_fold_timestamp_map(train_set, timestamp_map)
+    test_map, test_missing = _build_fold_timestamp_map(test_set, timestamp_map)
+    val_map, val_missing = _build_fold_timestamp_map(val_set, timestamp_map)
+
+    all_mashup_ids = sorted({int(m["id"]) for m in (train_set + test_set + val_set)})
+    all_map = {}
+    all_map.update(train_map)
+    all_map.update(test_map)
+    all_map.update(val_map)
+    all_missing = [mid for mid in all_mashup_ids if str(mid) not in all_map]
+
+    def _coverage(mapped_count, total_count):
+        if total_count == 0:
+            return 0.0
+        return float(mapped_count) / float(total_count)
+
+    report = {
+        "timestamp_map_file": timestamp_map_file if timestamp_map_file else None,
+        "timestamp_map_entries_loaded": len(timestamp_map),
+        "timestamp_fallback": timestamp_fallback,
+        "splits": {
+            "train": {
+                "total_mashups": len(train_set),
+                "mapped_mashups": len(train_map),
+                "missing_mashups": len(train_missing),
+                "coverage": _coverage(len(train_map), len(train_set)),
+                "missing_mashup_ids": train_missing,
+            },
+            "test": {
+                "total_mashups": len(test_set),
+                "mapped_mashups": len(test_map),
+                "missing_mashups": len(test_missing),
+                "coverage": _coverage(len(test_map), len(test_set)),
+                "missing_mashup_ids": test_missing,
+            },
+            "val": {
+                "total_mashups": len(val_set),
+                "mapped_mashups": len(val_map),
+                "missing_mashups": len(val_missing),
+                "coverage": _coverage(len(val_map), len(val_set)),
+                "missing_mashup_ids": val_missing,
+            },
+            "all": {
+                "total_mashups": len(all_mashup_ids),
+                "mapped_mashups": len(all_map),
+                "missing_mashups": len(all_missing),
+                "coverage": _coverage(len(all_map), len(all_mashup_ids)),
+                "missing_mashup_ids": all_missing,
+            },
+        },
+        "temporal_edges": temporal_stats,
+    }
+
+    _write_json(os.path.join(maps_dir, "train.json"), train_map)
+    _write_json(os.path.join(maps_dir, "test.json"), test_map)
+    _write_json(os.path.join(maps_dir, "val.json"), val_map)
+    _write_json(os.path.join(maps_dir, "all.json"), all_map)
+    _write_json(os.path.join(maps_dir, "coverage_report.json"), report)
 
 
 def main():
@@ -208,27 +331,39 @@ def main():
     all_tags = all_api_tags.union(all_mashup_tags)
     tag2id = {tag: i for i, tag in enumerate(sorted(all_tags))}
 
-    model_name = resolve_text_model_name(args.text_model)
-    model_tag = text_model_tag(args.text_model)
-    print(f"Using text model: {model_name} (tag={model_tag})")
+    if args.skip_embedding_generation != 1:
+        try:
+            from sentence_transformers import SentenceTransformer
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to import sentence_transformers. "
+                "Install a compatible environment or run with --skip_embedding_generation 1."
+            ) from exc
 
-    # Keep embeddings isolated per text model to avoid dimension collisions.
-    model_embedding_dir = embedding_dir(args.embedding_base_dir, args.text_model)
-    os.makedirs(model_embedding_dir, exist_ok=True)
+        model_name = resolve_text_model_name(args.text_model)
+        model_tag = text_model_tag(args.text_model)
+        print(f"Using text model: {model_name} (tag={model_tag})")
 
-    model = SentenceTransformer(model_name)
+        # Keep embeddings isolated per text model to avoid dimension collisions.
+        model_embedding_dir = embedding_dir(args.embedding_base_dir, args.text_model)
+        os.makedirs(model_embedding_dir, exist_ok=True)
 
-    save_vectors_h5(model, os.path.join(model_embedding_dir, "tag_vectors.h5"), {tid: tag for tag, tid in tag2id.items()})
+        model = SentenceTransformer(model_name)
 
-    api_id_to_desc = {api["id"]: api["details"].get("description", "") for api in apis}
-    save_vectors_h5(model, os.path.join(model_embedding_dir, "API_vectors.h5"), api_id_to_desc)
+        save_vectors_h5(model, os.path.join(model_embedding_dir, "tag_vectors.h5"), {tid: tag for tag, tid in tag2id.items()})
 
-    mashup_id_to_desc = {mashup["id"]: mashup.get("description", "") for mashup in mashups}
-    save_vectors_h5(model, os.path.join(model_embedding_dir, "vectors.h5"), mashup_id_to_desc)
+        api_id_to_desc = {api["id"]: api["details"].get("description", "") for api in apis}
+        save_vectors_h5(model, os.path.join(model_embedding_dir, "API_vectors.h5"), api_id_to_desc)
+
+        mashup_id_to_desc = {mashup["id"]: mashup.get("description", "") for mashup in mashups}
+        save_vectors_h5(model, os.path.join(model_embedding_dir, "vectors.h5"), mashup_id_to_desc)
+    else:
+        print("Skipping embedding generation (--skip_embedding_generation=1).")
 
     n_total = len(mashups)
     split_idx = round(n_total * 0.9)
     cv_mashups = mashups[:split_idx]
+    val_set = mashups[split_idx:]
     folds = 10
     fold_size = ceil(len(cv_mashups) / folds)
 
@@ -244,32 +379,55 @@ def main():
 
         write_static_interactions(os.path.join(fold_dir, "TE.csv"), train_set)
         write_static_interactions(os.path.join(fold_dir, "RS.csv"), test_set)
-        write_static_interactions(os.path.join(fold_dir, "VA.csv"), mashups[split_idx:])
+        write_static_interactions(os.path.join(fold_dir, "VA.csv"), val_set)
+
+        te_stats = {"edges": 0, "map_edges": 0, "fallback_edges": 0}
+        rs_stats = {"edges": 0, "map_edges": 0, "fallback_edges": 0}
+        va_stats = {"edges": 0, "map_edges": 0, "fallback_edges": 0}
 
         if args.write_temporal_files == 1:
-            te_stats = write_temporal_interactions(
-                os.path.join(fold_dir, "TE_temporal.csv"),
+            te_records, te_stats = build_temporal_records(
                 train_set,
                 timestamp_map,
                 args.timestamp_fallback,
             )
-            rs_stats = write_temporal_interactions(
-                os.path.join(fold_dir, "RS_temporal.csv"),
+            rs_records, rs_stats = build_temporal_records(
                 test_set,
                 timestamp_map,
                 args.timestamp_fallback,
             )
-            va_stats = write_temporal_interactions(
-                os.path.join(fold_dir, "VA_temporal.csv"),
-                mashups[split_idx:],
+            va_records, va_stats = build_temporal_records(
+                val_set,
                 timestamp_map,
                 args.timestamp_fallback,
             )
+
+            write_temporal_interactions(os.path.join(fold_dir, "TE_temporal.csv"), te_records)
+            write_temporal_interactions(os.path.join(fold_dir, "RS_temporal.csv"), rs_records)
+            write_temporal_interactions(os.path.join(fold_dir, "VA_temporal.csv"), va_records)
+
             print(
                 f"[fold{i + 1}] Temporal files generated | "
                 f"TE edges={te_stats['edges']} (map={te_stats['map_edges']}, fallback={te_stats['fallback_edges']}) | "
                 f"RS edges={rs_stats['edges']} (map={rs_stats['map_edges']}, fallback={rs_stats['fallback_edges']}) | "
                 f"VA edges={va_stats['edges']} (map={va_stats['map_edges']}, fallback={va_stats['fallback_edges']})"
+            )
+
+        if args.write_foldwise_timestamp_maps == 1:
+            _write_foldwise_timestamp_maps(
+                fold_dir=fold_dir,
+                timestamp_maps_subdir=args.fold_timestamp_maps_subdir,
+                train_set=train_set,
+                test_set=test_set,
+                val_set=val_set,
+                timestamp_map=timestamp_map,
+                timestamp_map_file=args.timestamp_map_file,
+                timestamp_fallback=args.timestamp_fallback,
+                temporal_stats={
+                    "TE": te_stats,
+                    "RS": rs_stats,
+                    "VA": va_stats,
+                },
             )
 
         with open(os.path.join(fold_dir, "api_tags.csv"), "w", encoding="utf-8") as f:

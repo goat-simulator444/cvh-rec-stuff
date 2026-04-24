@@ -1,0 +1,52 @@
+{
+  "splits": {
+    "all": {
+      "coverage": 1.0,
+      "mapped_mashups": 7163,
+      "missing_mashup_ids": [],
+      "missing_mashups": 0,
+      "total_mashups": 7163
+    },
+    "test": {
+      "coverage": 1.0,
+      "mapped_mashups": 645,
+      "missing_mashup_ids": [],
+      "missing_mashups": 0,
+      "total_mashups": 645
+    },
+    "train": {
+      "coverage": 1.0,
+      "mapped_mashups": 5802,
+      "missing_mashup_ids": [],
+      "missing_mashups": 0,
+      "total_mashups": 5802
+    },
+    "val": {
+      "coverage": 1.0,
+      "mapped_mashups": 716,
+      "missing_mashup_ids": [],
+      "missing_mashups": 0,
+      "total_mashups": 716
+    }
+  },
+  "temporal_edges": {
+    "RS": {
+      "edges": 1231,
+      "fallback_edges": 0,
+      "map_edges": 1231
+    },
+    "TE": {
+      "edges": 11305,
+      "fallback_edges": 0,
+      "map_edges": 11305
+    },
+    "VA": {
+      "edges": 1242,
+      "fallback_edges": 0,
+      "map_edges": 1242
+    }
+  },
+  "timestamp_fallback": "line_order",
+  "timestamp_map_entries_loaded": 7163,
+  "timestamp_map_file": "data/timestamp_map_hitices.json"
+}

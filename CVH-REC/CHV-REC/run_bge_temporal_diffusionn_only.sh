@@ -16,9 +16,9 @@ set -euo pipefail
 #   OUTPUT_BASE=../output/ablation_runs
 #   LOG_BASE=logs/ablation_runs
 #   STATS_BASE=stats/ablation_runs
-#   COMMON_MAIN_ARGS="--patience 5 --epoch 200 --lr 0.002 --alpha1 0.6 --alpha2 0.6 --alpha3 0.6 --alpha4 0.6 --save_flag 0"
-#   MEMORY_SAFE_MAIN_ARGS="--batch_size 128 --temporal_window_size 512 --temporal_stride 2 --temporal_max_steps 24 --edge_diffusion_hidden_dim 128 --edge_diffusion_steps 4 --edge_diffusion_max_pos_per_batch 1024 --edge_gen_topk_per_node 128 --edge_gen_chunk_size 1024"
-#   COMMON_TEXT_ARGS="--pretrain 0 --lr 0.002 --epoch 200 --patience 5 --save_flag 0"
+#   COMMON_MAIN_ARGS="--patience 5 --epoch 200 --lr 0.002 --alpha1 0.6 --alpha2 0.6 --alpha3 0.6 --alpha4 0.6 --save_flag 1 --batch_size 64 --temporal_window_size 2592000 --temporal_stride 4 --temporal_max_steps 6 --temporal_min_edges_per_slice 20 --temporal_recent_pool_multiplier 4 --edge_diffusion_hidden_dim 128 --edge_diffusion_steps 2 --edge_diffusion_max_pos_per_batch 128 --edge_gen_threshold 0.95 --edge_gen_max_edges_per_node 4 --edge_gen_topk_per_node 48 --edge_gen_max_total_edges 15000 --edge_gen_max_ratio_to_real 1.0 --edge_gen_refresh_interval 20 --edge_gen_warmup_epochs 20 --edge_gen_chunk_size 512"
+#   MEMORY_SAFE_MAIN_ARGS="--batch_size 64 --temporal_window_size 2592000 --temporal_stride 4 --temporal_max_steps 6 --temporal_min_edges_per_slice 20 --temporal_recent_pool_multiplier 4 --edge_diffusion_hidden_dim 96 --edge_diffusion_steps 2 --edge_diffusion_max_pos_per_batch 96 --edge_gen_threshold 0.97 --edge_gen_max_edges_per_node 3 --edge_gen_topk_per_node 32 --edge_gen_max_total_edges 12000 --edge_gen_max_ratio_to_real 0.8 --edge_gen_refresh_interval 25 --edge_gen_warmup_epochs 25 --edge_gen_chunk_size 384"
+#   COMMON_TEXT_ARGS="--pretrain 0 --lr 0.002 --epoch 200 --patience 5 --save_flag 1 --temporal_window_size 2592000 --temporal_stride 4 --temporal_max_steps 6 --temporal_min_edges_per_slice 20 --temporal_recent_pool_multiplier 4"
 
 DATASET="${1:-fold1}"
 METHOD="${2:-CVH-REC}"
@@ -65,9 +65,9 @@ OUTPUT_BASE="${OUTPUT_BASE:-../output/ablation_runs}"
 LOG_BASE="${LOG_BASE:-logs/ablation_runs}"
 STATS_BASE="${STATS_BASE:-stats/ablation_runs}"
 
-COMMON_MAIN_ARGS="${COMMON_MAIN_ARGS:---patience 5 --epoch 200 --lr 0.002 --alpha1 0.6 --alpha2 0.6 --alpha3 0.6 --alpha4 0.6 --save_flag 0}"
-MEMORY_SAFE_MAIN_ARGS="${MEMORY_SAFE_MAIN_ARGS:---batch_size 128 --temporal_window_size 512 --temporal_stride 2 --temporal_max_steps 24 --edge_diffusion_hidden_dim 128 --edge_diffusion_steps 4 --edge_diffusion_max_pos_per_batch 1024 --edge_gen_topk_per_node 128 --edge_gen_chunk_size 1024}"
-COMMON_TEXT_ARGS="${COMMON_TEXT_ARGS:---pretrain 0 --lr 0.002 --epoch 200 --patience 5 --save_flag 0}"
+COMMON_MAIN_ARGS="${COMMON_MAIN_ARGS:---patience 5 --epoch 200 --lr 0.002 --alpha1 0.6 --alpha2 0.6 --alpha3 0.6 --alpha4 0.6 --save_flag 1 --batch_size 64 --temporal_window_size 2592000 --temporal_stride 4 --temporal_max_steps 6 --temporal_min_edges_per_slice 20 --temporal_recent_pool_multiplier 4 --edge_diffusion_hidden_dim 128 --edge_diffusion_steps 2 --edge_diffusion_max_pos_per_batch 128 --edge_gen_threshold 0.95 --edge_gen_max_edges_per_node 4 --edge_gen_topk_per_node 48 --edge_gen_max_total_edges 15000 --edge_gen_max_ratio_to_real 1.0 --edge_gen_refresh_interval 20 --edge_gen_warmup_epochs 20 --edge_gen_chunk_size 512}"
+MEMORY_SAFE_MAIN_ARGS="${MEMORY_SAFE_MAIN_ARGS:---batch_size 64 --temporal_window_size 2592000 --temporal_stride 4 --temporal_max_steps 6 --temporal_min_edges_per_slice 20 --temporal_recent_pool_multiplier 4 --edge_diffusion_hidden_dim 96 --edge_diffusion_steps 2 --edge_diffusion_max_pos_per_batch 96 --edge_gen_threshold 0.97 --edge_gen_max_edges_per_node 3 --edge_gen_topk_per_node 32 --edge_gen_max_total_edges 12000 --edge_gen_max_ratio_to_real 0.8 --edge_gen_refresh_interval 25 --edge_gen_warmup_epochs 25 --edge_gen_chunk_size 384}"
+COMMON_TEXT_ARGS="${COMMON_TEXT_ARGS:---pretrain 0 --lr 0.002 --epoch 200 --patience 5 --save_flag 1 --temporal_window_size 2592000 --temporal_stride 4 --temporal_max_steps 6 --temporal_min_edges_per_slice 20 --temporal_recent_pool_multiplier 4}"
 
 read -r -a MAIN_ARGS_ARR <<< "${COMMON_MAIN_ARGS}"
 read -r -a SAFE_MAIN_ARGS_ARR <<< "${MEMORY_SAFE_MAIN_ARGS}"

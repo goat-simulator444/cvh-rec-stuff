@@ -86,6 +86,10 @@ def parse_args():
                         help='Maximum temporal steps kept in sequence (0 means all available steps).')
     parser.add_argument('--temporal_stride', type=int, default=1,
                         help='Use every n-th temporal step to reduce slowdown (1 means no downsampling).')
+    parser.add_argument('--temporal_min_edges_per_slice', type=int, default=0,
+                        help='Drop temporal slices with fewer than this many edges before max-step selection (0 disables filtering).')
+    parser.add_argument('--temporal_recent_pool_multiplier', type=int, default=4,
+                        help='When temporal_max_steps is active, choose steps from the last (temporal_max_steps * multiplier) candidates by edge density.')
     parser.add_argument('--temporal_debug_logs', type=int, default=0,
                         help='1: log per-step temporal embedding norms from TemporalHGNN.')
     parser.add_argument('--temporal_debug_log_every', type=int, default=1,
@@ -124,6 +128,8 @@ def parse_args():
                         help='Top-k candidates per mashup evaluated before threshold filtering.')
     parser.add_argument('--edge_gen_max_total_edges', type=int, default=50000,
                         help='Hard cap on total generated edges per refresh.')
+    parser.add_argument('--edge_gen_max_ratio_to_real', type=float, default=0.0,
+                        help='If >0, cap generated edges per refresh to this ratio times real edges before augmentation.')
     parser.add_argument('--edge_gen_refresh_interval', type=int, default=10,
                         help='Refresh interval (epochs) for graph augmentation using generated edges.')
     parser.add_argument('--edge_gen_warmup_epochs', type=int, default=10,
